@@ -21,7 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: 测试
-        run: cargo test --locked
+        run: cargo test
 
   build:
     needs: test
@@ -44,7 +44,7 @@ jobs:
         with:
           tool: cross
       - name: 编译
-        run: cross build --release --locked --target ${{ matrix.target }}
+        run: cross build --release --target ${{ matrix.target }}
       - name: 整理产物
         run: |
           mkdir -p dist
