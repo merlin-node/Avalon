@@ -10,6 +10,13 @@ use std::time::Duration;
 
 const COOKIE_NAME: &str = "pulse_admin";
 const SESSION_LIFETIME: i64 = 7 * 86400;
+/// admin-setup 建出来的账号。老数据库里没有这一项，也按它算。
+pub(super) const DEFAULT_USER: &str = "admin";
+const PASSWORD_MIN: usize = 12;
+/// 登录满这么久才算旧设备，才能踢人、改账号密码。
+const TRUST_AFTER: i64 = 86400;
+/// 上传恢复的大小上限。几十台机器、七天历史也就几十 MB；更大的库用命令行恢复。
+pub(super) const RESTORE_MAX: usize = 128 * 1024 * 1024;
 /// 同一来源地址 15 分钟内错 5 次即锁定该地址。旧版把计数存成一个全局值，
 /// 任何人持续错密码就能把管理员自己挡在门外。
 const LOGIN_WINDOW: i64 = 900;
@@ -32,17 +39,100 @@ fn client(headers:&HeaderMap)->String {
         .unwrap_or("local").to_string()
 }
 
-pub(super) fn set_password(path: &str, password: &str) -> Result<(), Box<dyn Error>> {
+/// 当前账号。没存过就是 admin：老数据库升级上来时不用迁移，照样进得去。
+pub(super) fn username(conn:&Connection)->String {
+    let name:String=conn.query_row("SELECT value FROM admin_settings WHERE key='username'",[],|r|r.get(0)).unwrap_or_default();
+    if name.is_empty() {DEFAULT_USER.to_string()} else {name}
+}
+/// 账号只收 ASCII：它要跟输入框里的内容做常量时间比较，多字节字符没有好处。
+fn valid_username(input:&str)->Option<String> {
+    let name=input.trim();
+    let shape=(1..=32).contains(&name.len())
+        && name.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'.'||b==b'_'||b==b'-'||b==b'@');
+    shape.then(||name.to_string())
+}
+
+/// 写账号，顺带换密码（password 为 None 就只改账号）。两种情况都清空所有会话：
+/// 凭据变了还留着旧会话，等于改了个寂寞。
+fn store_account(path:&str,name:&str,password:Option<&str>)->Result<(),Box<dyn Error>> {
     // argon2 的错误类型不实现 std::error::Error（要开 std 特性才有），
     // 所以不能直接用 ? 转成 Box<dyn Error>，先转成字符串。
-    let salt=SaltString::encode_b64(&random_bytes(16)?).map_err(|e|e.to_string())?;
-    let hash=Argon2::default().hash_password(password.as_bytes(),&salt).map_err(|e|e.to_string())?.to_string();
+    let hash=match password {
+        Some(password)=>{
+            let salt=SaltString::encode_b64(&random_bytes(16)?).map_err(|e|e.to_string())?;
+            Some(Argon2::default().hash_password(password.as_bytes(),&salt).map_err(|e|e.to_string())?.to_string())
+        }
+        None=>None,
+    };
     let mut conn=db(path)?;
     let tx=conn.transaction()?;
-    tx.execute("INSERT INTO admin_settings(key,value) VALUES('password',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&hash])?;
+    tx.execute("INSERT INTO admin_settings(key,value) VALUES('username',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [name])?;
+    if let Some(hash)=&hash {
+        tx.execute("INSERT INTO admin_settings(key,value) VALUES('password',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [hash])?;
+    }
     tx.execute("DELETE FROM admin_sessions",[])?;
     tx.commit()?;
     Ok(())
+}
+pub(super) fn set_credentials(path:&str,name:&str,password:&str)->Result<(),Box<dyn Error>> {
+    store_account(path,name,Some(password))
+}
+
+fn password_ok(conn:&Connection,password:&str)->bool {
+    let hash:String=conn.query_row("SELECT value FROM admin_settings WHERE key='password'",[],|r|r.get(0)).unwrap_or_default();
+    PasswordHash::new(&hash).ok().is_some_and(|h|Argon2::default().verify_password(password.as_bytes(),&h).is_ok())
+}
+/// 账号和密码一起判。账号错也照样把 argon2 跑完再合并结果：提前返回的话，
+/// 这个请求会明显比密码错的那次快，快慢本身就把「账号错了」说出去了。
+fn credentials_ok(conn:&Connection,name:&str,password:&str)->bool {
+    let name_ok=equal_secret(&username(conn),name.trim());
+    let pass_ok=password_ok(conn,password);
+    name_ok&&pass_ok
+}
+
+/// 登录限流。后台改密码那个表单也收当前密码，等于第二个登录入口，共用这一套；
+/// 不然它就是一条绕开限流慢慢试密码的路。
+fn locked(conn:&Connection,source:&str)->bool {
+    let until:Option<i64>=conn.query_row("SELECT until FROM login_attempts WHERE source=?",[source],|r|r.get(0)).optional().ok().flatten();
+    until.is_some_and(|until|until>now())
+}
+fn record_failure(conn:&Connection,source:&str) {
+    let attempt:Option<(i64,i64)>=conn.query_row("SELECT failures,first FROM login_attempts WHERE source=?",[source],|r|Ok((r.get(0)?,r.get(1)?))).optional().ok().flatten();
+    let (failures,first)=match attempt {
+        Some((failures,first)) if now()-first<LOGIN_WINDOW => (failures+1,first),
+        _ => (1,now()),
+    };
+    let until=if failures>=LOGIN_TRIES {now()+LOGIN_WINDOW} else {0};
+    let _=conn.execute("INSERT INTO login_attempts(source,failures,first,until) VALUES (?,?,?,?) ON CONFLICT(source) DO UPDATE SET failures=excluded.failures,first=excluded.first,until=excluded.until",params![source,failures,first,until]);
+    let _=conn.execute("DELETE FROM login_attempts WHERE until<? AND first<?",params![now(),now()-LOGIN_WINDOW]);
+}
+fn clear_failures(conn:&Connection,source:&str) {
+    let _=conn.execute("DELETE FROM login_attempts WHERE source=?",[source]);
+}
+
+/// 从浏览器标识粗略认出设备，只为在列表里分得清哪台是哪台，认不出也无妨。
+fn device(ua:&str)->String {
+    // 顺序有讲究：iPhone 的标识里也有 Mac OS X，安卓的里也有 Linux，Edge 的里也有 Chrome 和 Safari。
+    const SYSTEMS:[(&str,&str);6]=[("iPhone","iPhone"),("iPad","iPad"),("Android","Android"),("Mac OS X","Mac"),("Windows","Windows"),("Linux","Linux")];
+    const BROWSERS:[(&str,&str);5]=[("Edg/","Edge"),("Firefox/","Firefox"),("CriOS/","Chrome"),("Chrome/","Chrome"),("Safari/","Safari")];
+    match (pick_name(&SYSTEMS,ua),pick_name(&BROWSERS,ua)) {
+        (Some(system),Some(browser))=>format!("{system} · {browser}"),
+        (Some(one),None)|(None,Some(one))=>one.to_string(),
+        (None,None)=>"未知设备".to_string(),
+    }
+}
+fn pick_name(table:&[(&'static str,&'static str)],ua:&str)->Option<&'static str> {
+    table.iter().find(|(key,_)|ua.contains(*key)).map(|(_,name)|*name)
+}
+
+/// 这个会话能不能踢人、改账号密码。登录满 24 小时的可以；不满的，只有在没有比它
+/// 更早的会话时才可以（比如刚跑完 admin-setup，只有你一个在线）。
+/// 防的是别人偷到密码登进来，反手把你踢掉或者改掉密码。
+fn can_manage(conn:&Connection,hash:&str)->bool {
+    let created:i64=conn.query_row("SELECT created FROM admin_sessions WHERE hash=?",[hash],|r|r.get(0)).unwrap_or_else(|_|now());
+    if now()-created>=TRUST_AFTER {return true;}
+    let older:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM admin_sessions WHERE created<? AND expires>?)",params![created,now()],|r|r.get(0)).unwrap_or(true);
+    !older
 }
 
 /// 当前请求的登录会话。登录 cookie 从这一版起对全站有效（主域名上登录过才能看展示页），
@@ -96,9 +186,60 @@ fn frame(body:&str)->Html<String> {
     let body=body.replace("\"/admin/",&format!("\"{base}/")).replace("'/admin/",&format!("'{base}/"));
     Html(format!(r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{site} · 管理</title><style>
 :root{{color-scheme:light}}*{{box-sizing:border-box}}body{{margin:0;background:#f8fafb;color:#242b30;font:14px/1.6 system-ui,-apple-system,sans-serif}}
-header{{background:#fff;border-bottom:1px solid #d9dfe3;padding:14px max(16px,calc((100vw - 1050px)/2));display:flex;align-items:center;gap:24px}}a{{color:#386a9c}}header a{{text-decoration:none}}main{{max-width:1050px;margin:28px auto;padding:0 16px 60px}}h1{{font-size:21px;margin:0 0 15px}}h2{{font-size:16px;margin:0 0 12px}}.card{{background:#fff;border:1px solid #d9dfe3;padding:20px;margin:12px 0}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px}}label{{display:block;color:#626e76;font-size:13px}}input,select{{display:block;width:100%;border:1px solid #cdd6dc;border-radius:0;padding:9px 10px;background:#fff;color:#242b30;font:inherit;margin-top:5px}}input[type=checkbox]{{width:auto;display:inline-block;margin-right:5px}}input[type=radio]{{width:auto;display:inline-block;margin:0 5px 0 0;vertical-align:-1px}}.icons{{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}}.icon-choice{{display:flex;flex-direction:column;align-items:center;gap:6px;border:1px solid #d9dfe3;background:#fff;padding:10px 12px;cursor:pointer;min-width:96px;color:#242b30}}.icon-choice img{{object-fit:contain}}.upload{{margin-top:22px;padding-top:16px;border-top:1px dashed #e3e8eb}}button.link{{background:none;color:#b04747;padding:0;font-size:13px}}.icon-choice:has(input:checked){{border-color:#346d9b;box-shadow:0 0 0 1px #346d9b}}button{{background:#346d9b;color:white;border:0;border-radius:0;padding:10px 16px;cursor:pointer;font:inherit}}button.secondary{{background:#e8edef;color:#26333b}}button.danger{{background:#fff;color:#b04747;border:1px solid #e0c4c4}}form{{margin:0}}.actions{{display:flex;gap:10px;align-items:center;margin-top:15px;flex-wrap:wrap}}small,.muted{{color:#6d797f}}.node{{border-top:1px solid #e3e8eb;padding:15px 0}}.node:first-child{{border-top:0}}details>summary{{cursor:pointer;font-weight:650;font-size:15px}}code{{overflow-wrap:anywhere}}.ok{{color:#329356}}.down{{color:#c05252}}.picker{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 12px;max-height:230px;overflow:auto;border:1px solid #e3e8eb;padding:10px;margin-top:6px}}.picker label{{color:#242b30}}.brand{{display:flex;align-items:center;gap:8px}}.brand img{{object-fit:contain}}.cmd{{display:block;white-space:pre-wrap;word-break:break-all;background:#f2f5f7;border:1px solid #d9dfe3;padding:12px;margin:10px 0;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#242b30;-webkit-user-select:all;user-select:all}}@media(max-width:600px){{main{{margin:12px auto}}.card{{padding:14px}}}}</style><header><strong class="brand"><img src="{base}/icon" alt="" width="20" height="20">{site}</strong><a href="/">首页</a><span class="muted">管理</span></header><main>{body}</main></html>"#))
+header{{background:#fff;border-bottom:1px solid #d9dfe3;padding:14px max(16px,calc((100vw - 1050px)/2));display:flex;align-items:center;gap:24px}}a{{color:#386a9c}}header a{{text-decoration:none}}main{{max-width:1050px;margin:28px auto;padding:0 16px 60px}}h1{{font-size:21px;margin:0 0 15px}}h2{{font-size:16px;margin:0 0 12px}}.card{{background:#fff;border:1px solid #d9dfe3;padding:20px;margin:12px 0}}.card>summary{{font-size:16px;font-weight:700;margin:0}}.card[open]>summary{{margin:0 0 12px}}.row{{display:flex;gap:8px;align-items:flex-start}}.row>details{{flex:1;min-width:0}}.move{{display:flex;gap:4px;margin:0;flex:none}}.move button{{padding:2px 10px;min-width:34px}}.ghost{{visibility:hidden}}.grow{{flex:1;min-width:0}}button:disabled{{opacity:.45;cursor:not-allowed}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px}}label{{display:block;color:#626e76;font-size:13px}}input,select{{display:block;width:100%;border:1px solid #cdd6dc;border-radius:0;padding:9px 10px;background:#fff;color:#242b30;font:inherit;margin-top:5px}}input[type=checkbox]{{width:auto;display:inline-block;margin-right:5px}}input[type=radio]{{width:auto;display:inline-block;margin:0 5px 0 0;vertical-align:-1px}}.icons{{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}}.icon-choice{{display:flex;flex-direction:column;align-items:center;gap:6px;border:1px solid #d9dfe3;background:#fff;padding:10px 12px;cursor:pointer;min-width:96px;color:#242b30}}.icon-choice img{{object-fit:contain}}.upload{{margin-top:22px;padding-top:16px;border-top:1px dashed #e3e8eb}}button.link{{background:none;color:#b04747;padding:0;font-size:13px}}.icon-choice:has(input:checked){{border-color:#346d9b;box-shadow:0 0 0 1px #346d9b}}button{{background:#346d9b;color:white;border:0;border-radius:0;padding:10px 16px;cursor:pointer;font:inherit}}button.secondary{{background:#e8edef;color:#26333b}}button.danger{{background:#fff;color:#b04747;border:1px solid #e0c4c4}}form{{margin:0}}.actions{{display:flex;gap:10px;align-items:center;margin-top:15px;flex-wrap:wrap}}small,.muted{{color:#6d797f}}.node{{border-top:1px solid #e3e8eb;padding:15px 0}}.node:first-child{{border-top:0}}details>summary{{cursor:pointer;font-weight:650;font-size:15px}}code{{overflow-wrap:anywhere}}.ok{{color:#329356}}.down{{color:#c05252}}.picker{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 12px;max-height:230px;overflow:auto;border:1px solid #e3e8eb;padding:10px;margin-top:6px}}.picker label{{color:#242b30}}.brand{{display:flex;align-items:center;gap:8px}}.brand img{{object-fit:contain}}.cmd{{display:block;white-space:pre-wrap;word-break:break-all;background:#f2f5f7;border:1px solid #d9dfe3;padding:12px;margin:10px 0;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#242b30;-webkit-user-select:all;user-select:all}}@media(max-width:600px){{main{{margin:12px auto}}.card{{padding:14px}}}}</style><header><strong class="brand"><img src="{base}/icon" alt="" width="20" height="20">{site}</strong><a href="/">首页</a><span class="muted">管理</span></header><main>{body}</main></html>"#))
 }
 fn failure(code:StatusCode,message:&str)->Response {(code,frame(&format!("<p>{}</p><p><a href='/admin/'>返回管理</a></p>",esc(message)))).into_response()}
+
+/// 一张可折叠的卡片。用的是浏览器自带的 details，不需要 JS。
+fn card(id:&str,title:&str,open:bool,body:&str)->String {
+    format!("<details class=\"card\" id=\"{id}\"{}><summary>{title}</summary>{body}</details>",if open {" open"} else {""})
+}
+/// 保存完回后台首页。带上 ?open=… 让刚动过的那张卡片自己展开，同名的 #锚点
+/// 再让浏览器滚到它那儿——保存一次就得重新点开一遍，太烦。
+fn back(open:&str)->Response {back_to(open,open)}
+/// 展开 open 那张卡片，滚到 anchor 那一行。排序时用：卡片要开着，那一行本身不用展开。
+fn back_to(open:&str,anchor:&str)->Response {
+    Redirect::to(&format!("{}?open={open}#{anchor}",access::admin_home())).into_response()
+}
+
+/// 每行右侧的 ↑↓。到头的那一个换成看不见的占位，免得上下两行的按钮错开。
+fn mover(action:&str,csrf:&str,index:usize,count:usize)->String {
+    let up=if index>0 {r#"<button class="secondary" name="dir" value="up" aria-label="上移">↑</button>"#} else {r#"<button class="secondary ghost" disabled>↑</button>"#};
+    let down=if index+1<count {r#"<button class="secondary" name="dir" value="down" aria-label="下移">↓</button>"#} else {r#"<button class="secondary ghost" disabled>↓</button>"#};
+    format!(r#"<form class="move" method="post" action="{action}"><input type="hidden" name="csrf" value="{csrf}">{up}{down}</form>"#)
+}
+/// 把 target 和上面（或下面）那个对调，返回新的整张顺序；到头了或找不到就是 None。
+fn swapped<T:PartialEq+Clone>(order:&[T],target:&T,up:bool)->Option<Vec<T>> {
+    let i=order.iter().position(|x|x==target)?;
+    let j=if up {i.checked_sub(1)?} else {i+1};
+    if j>=order.len() {return None;}
+    let mut next=order.to_vec();
+    next.swap(i,j);
+    Some(next)
+}
+/// 移动一行，然后在同一个事务里把整张表按 1、2、3…重新编号。
+/// 只改两行的 sort 不够：老数据全是 0，两个 0 对调还是 0。
+/// table 和 order_by 只来自代码里的常量，不来自请求。
+fn move_row(conn:&mut Connection,table:&str,order_by:&str,id:&str,up:bool)->rusqlite::Result<bool> {
+    let tx=conn.transaction()?;
+    let order:Vec<String>={
+        let mut stmt=tx.prepare(&format!("SELECT CAST(id AS TEXT) FROM {table} ORDER BY {order_by}"))?;
+        let rows=stmt.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let Some(next)=swapped(&order,&id.to_string(),up) else {return Ok(false)};
+    for (index,row) in next.iter().enumerate() {
+        tx.execute(&format!("UPDATE {table} SET sort=? WHERE id=?"),params![index as i64+1,row])?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+/// ?open= 的值最后要写进 HTML 的 id 和 open 判断里，先把字符集收死。
+fn opened(value:Option<&str>)->String {
+    let value=value.unwrap_or("");
+    let shape=value.len()<=40 && value.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'-');
+    if shape {value.to_string()} else {String::new()}
+}
 
 /// axum 的 Form 走 serde_urlencoded，同名键只保留一个，装不下一组复选框。
 /// 监控表单因此自己解析 body；form_urlencoded 本来就在依赖树里（url 的依赖）。
@@ -133,6 +274,50 @@ fn parse_target(input:&str)->Option<(String,u16)> {
     (port>0 && shape).then_some((host,port))
 }
 
+/// 改账号和密码。要先输当前密码；新密码留空表示只改账号。
+/// 登录设备。本机不给踢出按钮，要走就用退出登录；新设备的按钮是灰的，服务端也会拒绝。
+fn sessions_section(conn:&Connection,csrf:&str,current:&str,manage:bool)->String {
+    let disabled=if manage {""} else {" disabled"};
+    let shown=|value:&str|if value.is_empty() {"未知".to_string()} else {esc(value)};
+    let mut body=String::new();
+    let mut others=0;
+    if let Ok(mut stmt)=conn.prepare("SELECT rowid,hash,device,source,CASE WHEN created>0 THEN strftime('%m-%d %H:%M',created,'unixepoch','localtime') ELSE '' END FROM admin_sessions WHERE expires>? ORDER BY created DESC") {
+        if let Ok(rows)=stmt.query_map([now()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?))) {
+            for (id,hash,name,source,time) in rows.flatten() {
+                let action=if hash==current {"<small>本机</small>".to_string()} else {
+                    others+=1;
+                    format!(r#"<form method="post" action="/admin/sessions"><input type="hidden" name="csrf" value="{csrf}"><button class="danger" name="target" value="{id}"{disabled}>踢出</button></form>"#)
+                };
+                body.push_str(&format!(r#"<div class="node row"><span class="grow">{} <small>· {} · {}</small></span>{action}</div>"#,shown(&name),shown(&source),shown(&time)));
+            }
+        };
+    }
+    if others>0 {
+        let hint=if manage {""} else {"<small>登录满 24 小时后可用</small>"};
+        body.push_str(&format!(r#"<form method="post" action="/admin/sessions"><input type="hidden" name="csrf" value="{csrf}"><div class="actions"><button class="danger" name="target" value="others"{disabled}>踢出其他全部</button>{hint}</div></form>"#));
+    }
+    body
+}
+
+/// 下载和上传恢复，和 Komari 一样：新机器用同一个域名、传上旧备份，被控机一台都不用动。
+fn backup_section(csrf:&str)->String {
+    format!(r#"<form method="post" action="/admin/backup"><input type="hidden" name="csrf" value="{csrf}"><div class="actions"><button>下载备份</button></div></form>
+<form class="upload" method="post" action="/admin/backup/restore" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{csrf}">
+<label>上传恢复<input type="file" name="backup" accept=".db" required></label>
+<div class="actions"><label><input type="checkbox" name="confirm" value="1" required>覆盖现有全部数据</label><button class="danger">恢复</button></div></form>
+<p class="muted">备份里有节点 token 和 Bot Token，按密码保管。恢复后用备份里的账号密码登录，后台地址也变回备份里的。</p>"#)
+}
+
+fn account_section(conn:&Connection,csrf:&str,manage:bool)->String {
+    format!(r#"<form method="post" action="/admin/account"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
+<label>账号<input name="username" value="{}" maxlength="32" autocomplete="username" required></label>
+<label>当前密码<input type="password" name="current" autocomplete="current-password" required></label>
+<label>新密码<input type="password" name="password" minlength="{PASSWORD_MIN}" maxlength="128" autocomplete="new-password"></label>
+<label>确认新密码<input type="password" name="confirm" minlength="{PASSWORD_MIN}" maxlength="128" autocomplete="new-password"></label></div>
+<div class="actions"><button{}>保存</button><small>{}</small></div></form>"#,
+        esc(&username(conn)),if manage {""} else {" disabled"},if manage {"保存后需重新登录"} else {"登录满 24 小时后可用"})
+}
+
 /// 站点名称和图标。图标单选切换；上传的图片和表情可以删除，删掉的若正在用就切回机箱。
 fn site_section(conn:&Connection,csrf:&str)->String {
     let current=site::current_choice(conn);
@@ -145,7 +330,7 @@ fn site_section(conn:&Connection,csrf:&str)->String {
         let delete=if matches!(key,"upload"|"emoji") {format!(r#"<button class="link" name="delete" value="{key}">删除</button>"#)} else {String::new()};
         choices.push_str(&format!(r#"<label class="icon-choice"><img src="/admin/icon/{key}" alt="" width="40" height="40"><span><input type="radio" name="icon" value="{key}"{checked}>{label}</span>{delete}</label>"#));
     }
-    format!(r#"<section class="card"><h2>站点</h2><form method="post" action="/admin/site"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
+    format!(r#"<form method="post" action="/admin/site"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
 <label>站点名称<input name="site_name" value="{}" maxlength="30" required></label>
 <label>表情图标<input name="emoji" maxlength="16" placeholder="📡"></label></div>
 <div class="actions"><button>保存</button></div></form>
@@ -153,19 +338,18 @@ fn site_section(conn:&Connection,csrf:&str)->String {
 <div class="icons">{choices}</div><div class="actions"><button>使用</button></div></form>
 <form class="upload" method="post" action="/admin/site/icon" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{csrf}">
 <label>上传图片<input type="file" name="icon" accept="image/png,image/jpeg,image/gif,image/webp,image/x-icon" required></label>
-<div class="actions"><button class="secondary">上传</button></div></form></div></section>"#,
+<div class="actions"><button class="secondary">上传</button></div></form></div>"#,
         esc(&site::name()))
 }
 
 /// 访问控制：后台地址、展示页域名、公开页开关。
 fn access_section(csrf:&str,here:&str)->String {
     let checked=if access::public_enabled() {"checked"} else {""};
-    format!(r#"<section class="card"><h2>访问控制</h2>
-<form method="post" action="/admin/access"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
+    format!(r#"<form method="post" action="/admin/access"><input type="hidden" name="csrf" value="{csrf}"><div class="grid">
 <label>后台地址<input name="admin_path" value="{}" maxlength="48" required></label>
 <label>展示页域名<input name="display_domain" value="{}" maxlength="253" placeholder="status.example.com"></label></div>
 <div class="actions"><label><input type="checkbox" name="public" value="1" {checked}>开放公开状态页</label><button>保存</button></div></form>
-<p class="muted">主域名 <code>{}</code>　忘记后台地址：<code>docker compose exec avalon probe-hub access</code></p></section>"#,
+<p class="muted">主域名 <code>{}</code>　忘记后台地址：<code>docker compose exec avalon probe-hub access</code></p>"#,
         esc(&access::admin_path()),esc(&access::display_domain()),esc(here))
 }
 
@@ -267,7 +451,7 @@ fn cycle_picker(current:&str)->String {
 }
 
 fn node_picker(conn:&Connection,chosen:&HashSet<String>)->String {
-    let Ok(mut stmt)=conn.prepare("SELECT id,name FROM nodes ORDER BY name") else {return String::new()};
+    let Ok(mut stmt)=conn.prepare("SELECT id,name FROM nodes ORDER BY sort,name") else {return String::new()};
     let Ok(rows)=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))) else {return String::new()};
     let mut html=String::from("<div class=\"picker\">");
     for (id,name) in rows.flatten() {
@@ -292,90 +476,111 @@ fn monitor_form(conn:&Connection,csrf:&str,id:Option<i64>,name:&str,target:&str,
         node_picker(conn,chosen),if auto {"checked"} else {""})
 }
 
-fn monitors_section(conn:&Connection,csrf:&str)->String {
-    let mut body=String::from("<section class=\"card\"><h2>延迟监控</h2>");
-    let Ok(mut stmt)=conn.prepare("SELECT id,name,host,port,interval,auto_join FROM monitors ORDER BY id") else {return body};
+fn monitors_section(conn:&Connection,csrf:&str,open:&str)->String {
+    let mut body=String::new();
+    let Ok(mut stmt)=conn.prepare("SELECT id,name,host,port,interval,auto_join FROM monitors ORDER BY sort,id") else {return body};
     let Ok(rows)=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,i64>(5)?))) else {return body};
     let monitors:Vec<_>=rows.flatten().collect();
     if monitors.is_empty() {body.push_str("<p class=\"muted\">还没有监控。</p>");}
-    for (id,name,host,port,interval,auto) in monitors {
+    let count=monitors.len();
+    for (index,(id,name,host,port,interval,auto)) in monitors.into_iter().enumerate() {
         let mut chosen:HashSet<String>=HashSet::new();
         if let Ok(mut stmt)=conn.prepare("SELECT node_id FROM monitor_nodes WHERE monitor_id=?") {
             if let Ok(rows)=stmt.query_map([id],|r|r.get::<_,String>(0)) {chosen.extend(rows.flatten());};
         }
         let target=if host.contains(':') {format!("[{host}]:{port}")} else {format!("{host}:{port}")};
-        body.push_str(&format!("<div class=\"node\"><details><summary>{} <small>· {} · {interval}s · {} 个节点</small></summary>{}</details></div>",
-            esc(&name),esc(&target),chosen.len(),monitor_form(conn,csrf,Some(id),&name,&target,interval,auto==1,&chosen)));
+        let anchor=format!("m-{id}");
+        body.push_str(&format!("<div class=\"node row\"><details id=\"{anchor}\"{}><summary>{} <small>· {} · {interval}s · {} 个节点</small></summary>{}</details>{}</div>",
+            if open==anchor {" open"} else {""},
+            esc(&name),esc(&target),chosen.len(),monitor_form(conn,csrf,Some(id),&name,&target,interval,auto==1,&chosen),
+            mover(&format!("/admin/monitors/{id}/move"),csrf,index,count)));
     }
-    body.push_str(&format!("</section><section class=\"card\"><h2>添加监控</h2>{}</section>",
-        monitor_form(conn,csrf,None,"","",60,false,&HashSet::new())));
     body
 }
 
-pub(super) async fn page(State(state):State<App>,headers:HeaderMap)->Response {
+#[derive(Deserialize)] pub(super) struct Panel {open:Option<String>}
+pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):Query<Panel>)->Response {
     let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
-    let Some((_,csrf))=session(&headers,&conn) else {
+    let Some((current,csrf))=session(&headers,&conn) else {
         let configured:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM admin_settings WHERE key='password')",[],|r|r.get(0)).unwrap_or(false);
-        let tip=if configured {"请输入在 VPS 上运行 admin-setup 得到的密码。"} else {"先在 VPS 执行：runuser -u probe -- /usr/local/bin/probe-hub admin-setup --db /var/lib/linux-probe/probe.db"};
-        return frame(&format!("<section class='card'><h1>管理员登录</h1><p>{}</p><form method='post' action='/admin/login'><label>密码<input type='password' name='password' autocomplete='current-password' required></label><div class='actions'><button>登录</button></div></form></section>",esc(tip))).into_response();
+        let tip=if configured {"请输入 admin-setup 给出的账号和密码。"} else {"先在 VPS 执行：runuser -u probe -- /usr/local/bin/probe-hub admin-setup --db /var/lib/linux-probe/probe.db"};
+        return frame(&format!("<section class='card'><h1>管理员登录</h1><p>{}</p><form method='post' action='/admin/login'><label>账号<input name='username' maxlength='32' autocomplete='username' required></label><label>密码<input type='password' name='password' autocomplete='current-password' required></label><div class='actions'><button>登录</button></div></form></section>",esc(tip))).into_response();
     };
+    let open=opened(query.open.as_deref());
+    let manage=can_manage(&conn,&current);
     let bot:bool=conn.query_row("SELECT value!='' FROM admin_settings WHERE key='bot_token'",[],|r|r.get(0)).unwrap_or(false);
     let chat:String=conn.query_row("SELECT value FROM admin_settings WHERE key='chat_id'",[],|r|r.get(0)).unwrap_or_default();
     let base=public_base(&headers);
-    let mut body=format!("<h1>节点管理</h1>{}{}<section class='card'><h2>节点</h2>",site_section(&conn,&csrf),access_section(&csrf,&request_hosts(&headers).into_iter().next().unwrap_or_default()));
-    let mut stmt=match conn.prepare("SELECT n.id,n.name,n.public,n.last_seen,n.token,c.country,c.display_ip,c.notify,c.remark,c.price,c.currency,c.billing_cycle,c.expires_at,c.traffic_limit,c.traffic_mode,c.traffic_reset_day,(SELECT COUNT(*) FROM monitor_nodes m WHERE m.node_id=n.id),COALESCE(c.auto_renew,1),COALESCE(t.total_rx,0),COALESCE(t.total_tx,0) FROM nodes n LEFT JOIN node_config c ON n.id=c.node_id LEFT JOIN traffic t ON t.node_id=n.id ORDER BY n.name") {Ok(s)=>s,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    let mut body=String::new();
+    let mut stmt=match conn.prepare("SELECT n.id,n.name,n.public,n.last_seen,n.token,c.country,c.display_ip,c.notify,c.remark,c.price,c.currency,c.billing_cycle,c.expires_at,c.traffic_limit,c.traffic_mode,c.traffic_reset_day,(SELECT COUNT(*) FROM monitor_nodes m WHERE m.node_id=n.id),COALESCE(c.auto_renew,1),COALESCE(t.total_rx,0),COALESCE(t.total_tx,0) FROM nodes n LEFT JOIN node_config c ON n.id=c.node_id LEFT JOIN traffic t ON t.node_id=n.id ORDER BY n.sort,n.name") {Ok(s)=>s,Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,Option<i64>>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?.unwrap_or_default(),r.get::<_,Option<String>>(6)?.unwrap_or_default(),r.get::<_,Option<i64>>(7)?.unwrap_or(1),r.get::<_,Option<String>>(8)?.unwrap_or_default(),r.get::<_,Option<f64>>(9)?.unwrap_or(0.0),r.get::<_,Option<String>>(10)?.unwrap_or_default(),r.get::<_,Option<String>>(11)?.unwrap_or_default(),r.get::<_,Option<String>>(12)?.unwrap_or_default(),r.get::<_,Option<i64>>(13)?.unwrap_or(0),r.get::<_,Option<String>>(14)?.unwrap_or_default(),r.get::<_,Option<i64>>(15)?.unwrap_or(1),r.get::<_,i64>(16)?,r.get::<_,i64>(17)?,r.get::<_,i64>(18)?,r.get::<_,i64>(19)?)));
     let today=local_today(&conn).ok().flatten();
-    if let Ok(rows)=rows { for row in rows.flatten() {
+    let rows:Vec<_>=match rows {Ok(rows)=>rows.flatten().collect(),Err(_)=>Vec::new()};
+    let count=rows.len();
+    for (index,row) in rows.into_iter().enumerate() {
         let (id,name,public,seen,token,country,ip,notify,remark,price,currency,cycle,expires,limit,mode,reset,monitors,auto_renew,total_rx,total_tx)=row;
         let (month_rx,month_tx)=today.and_then(|today|period_usage(&conn,&id,reset,today).ok()).unwrap_or((0,0));
         let limit_text=if limit>0 {gb(limit)} else {String::new()};
         let cycle_select=cycle_picker(&cycle);
         let is_online=seen.is_some_and(|v|now()-v<30);
         let status=if is_online {"<span class='ok'>在线</span>"} else {"<span class='down'>离线</span>"};
-        body.push_str(&format!(r#"<div class="node"><details><summary>{status}　{} <small>· {monitors} 个监控 · {}</small></summary><p class="muted">{}</p><p class="muted">安装命令</p><code class="cmd">{}</code><p class="muted">卸载：<code>{}</code></p><form method="post" action="/admin/nodes/{}"><input type="hidden" name="csrf" value="{}"><div class="grid">
+        let anchor=format!("n-{id}");
+        let unfold=if open==anchor {" open"} else {""};
+        let arrows=mover(&format!("/admin/nodes/{}/move",esc(&id)),&csrf,index,count);
+        body.push_str(&format!(r#"<div class="node row"><details id="{anchor}"{unfold}><summary>{status}　{} <small>· {monitors} 个监控 · {}</small></summary><p class="muted">{}</p><p class="muted">安装命令</p><code class="cmd">{}</code><p class="muted">卸载：<code>{}</code></p><form method="post" action="/admin/nodes/{}"><input type="hidden" name="csrf" value="{}"><div class="grid">
 <label>名称<input name="name" value="{}" maxlength="80" required></label><label>国家/地区代码<input name="country" value="{}" maxlength="2" placeholder="HK"></label><label>手填 IP<input name="display_ip" value="{}" maxlength="100"></label><label>备注<input name="remark" value="{}" maxlength="300"></label><label>价格<input name="price" type="number" min="0" step="0.01" value="{}"></label><label>货币<input name="currency" value="{}" maxlength="8" placeholder="$"></label><label>计费周期{}</label><label>到期日期<input name="expires_at" type="date" value="{}"></label><label>每月额度（GB）<input name="traffic_limit" type="number" min="0" step="0.01" value="{}" placeholder="不限"></label><label>计算方式{}</label><label>流量重置日<input name="traffic_reset_day" type="number" min="1" max="31" value="{}"></label></div>
 <details><summary class="muted">流量校正</summary><div class="grid">
 <label>总下行（GB）<input name="fix_total_rx" type="number" min="0" step="0.01" placeholder="现在 {}"></label><label>总上行（GB）<input name="fix_total_tx" type="number" min="0" step="0.01" placeholder="现在 {}"></label>
-<label>本期下行（GB）<input name="fix_month_rx" type="number" min="0" step="0.01" placeholder="现在 {}"></label><label>本期上行（GB）<input name="fix_month_tx" type="number" min="0" step="0.01" placeholder="现在 {}"></label></div></details><div class="actions"><label><input type="checkbox" name="public" value="1" {}>公开显示</label><label><input type="checkbox" name="notify" value="1" {}>掉线/到期通知</label><label><input type="checkbox" name="auto_renew" value="1" {}>到期后仍在线自动续期</label><button>保存节点</button><button class="secondary" name="action" value="rotate" formnovalidate>重新生成 Token</button><label><input type="checkbox" name="confirm" value="1">确认</label><button class="danger" name="action" value="delete" formnovalidate>删除节点</button></div></form></details></div>"#,
+<label>本期下行（GB）<input name="fix_month_rx" type="number" min="0" step="0.01" placeholder="现在 {}"></label><label>本期上行（GB）<input name="fix_month_tx" type="number" min="0" step="0.01" placeholder="现在 {}"></label></div></details><div class="actions"><label><input type="checkbox" name="public" value="1" {}>公开显示</label><label><input type="checkbox" name="notify" value="1" {}>掉线/到期通知</label><label><input type="checkbox" name="auto_renew" value="1" {}>到期后仍在线自动续期</label><button>保存节点</button><button class="secondary" name="action" value="rotate" formnovalidate>重新生成 Token</button><label><input type="checkbox" name="confirm" value="1">确认</label><button class="danger" name="action" value="delete" formnovalidate>删除节点</button></div></form></details>{arrows}</div>"#,
         esc(&name),if public==1 {"公开"} else {"私有"},ip_line(&conn,&id),esc(&install_command(&base,&id,&token)),esc(&uninstall_command()),esc(&id),csrf,esc(&name),esc(&country),esc(&ip),esc(&remark),price,esc(&currency),cycle_select,esc(&expires),limit_text,mode_picker(&mode),reset,gb(total_rx),gb(total_tx),gb(month_rx),gb(month_tx),if public==1 {"checked"} else {""},if notify==1 {"checked"} else {""},if auto_renew==1 {"checked"} else {""}));
-    }}
-    body.push_str(&format!(r#"</section><section class="card"><h2>添加节点</h2><form method="post" action="/admin/nodes"><input type="hidden" name="csrf" value="{csrf}"><label>节点名称<input name="name" maxlength="80" required></label><div class="actions"><button>创建并显示 Agent 凭据</button></div></form></section>"#));
-    body.push_str(&monitors_section(&conn,&csrf));
-    body.push_str(&format!(r#"<section class="card"><h2>Telegram 通知</h2><form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{}"><div class="grid"><label>Bot Token<input type="password" name="bot_token" autocomplete="off" placeholder="{}"></label><label>Chat ID<input name="chat_id" value="{}" maxlength="80"></label></div><div class="actions"><button>保存通知设置</button><label><input type="checkbox" name="clear_token" value="1">清除 Token</label></div></form><form method="post" action="/admin/test"><input type="hidden" name="csrf" value="{}"><div class="actions"><button class="secondary">发送测试通知</button></div></form></section><form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{}"><button class="secondary">退出登录</button></form>"#,
-        csrf,if bot {"已保存，留空则不修改"} else {"123456:ABC..."},esc(&chat),csrf,csrf));
-    frame(&body).into_response()
+    }
+    if count==0 {body.push_str("<p class=\"muted\">还没有节点。</p>");}
+    let add_node=format!(r#"<form method="post" action="/admin/nodes"><input type="hidden" name="csrf" value="{csrf}"><label>节点名称<input name="name" maxlength="80" required></label><div class="actions"><button>创建并显示 Agent 凭据</button></div></form>"#);
+    let telegram=format!(r#"<form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid"><label>Bot Token<input type="password" name="bot_token" autocomplete="off" placeholder="{}"></label><label>Chat ID<input name="chat_id" value="{}" maxlength="80"></label></div><div class="actions"><button>保存通知设置</button><label><input type="checkbox" name="clear_token" value="1">清除 Token</label></div></form><form method="post" action="/admin/test"><input type="hidden" name="csrf" value="{csrf}"><div class="actions"><button class="secondary">发送测试通知</button></div></form>"#,
+        if bot {"已保存，留空则不修改"} else {"123456:ABC..."},esc(&chat));
+    let here=request_hosts(&headers).into_iter().next().unwrap_or_default();
+    // 常看的排前面，默认也只展开「节点」；设一次就不动的几张收在下面。
+    let page=format!("<h1>节点管理</h1>{}{}{}{}{}{}{}{}{}{}<form method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"secondary\">退出登录</button></form>",
+        card("add-node","添加节点",open=="add-node",&add_node),
+        card("nodes","节点",open.is_empty()||open=="nodes"||open.starts_with("n-"),&body),
+        card("add-monitor","添加监控",open=="add-monitor",&monitor_form(&conn,&csrf,None,"","",60,false,&HashSet::new())),
+        card("monitors","延迟监控",open=="monitors"||open.starts_with("m-"),&monitors_section(&conn,&csrf,&open)),
+        card("site","站点",open=="site",&site_section(&conn,&csrf)),
+        card("access","访问控制",open=="access",&access_section(&csrf,&here)),
+        card("telegram","Telegram 通知",open=="telegram",&telegram),
+        card("account","账号",open=="account",&account_section(&conn,&csrf,manage)),
+        card("sessions","登录设备",open=="sessions",&sessions_section(&conn,&csrf,&current,manage)),
+        card("backup","备份",open=="backup",&backup_section(&csrf)));
+    frame(&page).into_response()
 }
 
-#[derive(Deserialize)] pub(super) struct Login { password:String }
+#[derive(Deserialize)] pub(super) struct Login { username:String, password:String }
 pub(super) async fn login(State(state):State<App>,headers:HeaderMap,Form(form):Form<Login>)->Response {
     if !same_origin(&headers) {return failure(StatusCode::FORBIDDEN,"请求来源不正确");}
     let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     let source=client(&headers);
-    let attempt:Option<(i64,i64,i64)>=conn.query_row("SELECT failures,first,until FROM login_attempts WHERE source=?",[&source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().ok().flatten();
-    if attempt.is_some_and(|(_,_,until)|until>now()) {return failure(StatusCode::TOO_MANY_REQUESTS,"该地址登录失败次数过多，请十五分钟后再试");}
+    if locked(&conn,&source) {return failure(StatusCode::TOO_MANY_REQUESTS,"该地址登录失败次数过多，请十五分钟后再试");}
     // argon2 是故意算得慢的，同时只放一个进去；排队而不是直接拒绝，
     // 否则两个人同时点一下登录就有一个吃 429。
     let Ok(Ok(permit))=tokio::time::timeout(Duration::from_secs(3),LOGIN_GATE.acquire()).await else {
         return failure(StatusCode::TOO_MANY_REQUESTS,"登录请求太多，请稍后重试");
     };
-    let hash:String=conn.query_row("SELECT value FROM admin_settings WHERE key='password'",[],|r|r.get(0)).unwrap_or_default();
-    let verified=PasswordHash::new(&hash).ok().is_some_and(|h|Argon2::default().verify_password(form.password.as_bytes(),&h).is_ok());
+    let verified=credentials_ok(&conn,&form.username,&form.password);
     drop(permit);
     if !verified {
-        let (failures,first)=match attempt {
-            Some((failures,first,_)) if now()-first<LOGIN_WINDOW => (failures+1,first),
-            _ => (1,now()),
-        };
-        let until=if failures>=LOGIN_TRIES {now()+LOGIN_WINDOW} else {0};
-        let _=conn.execute("INSERT INTO login_attempts(source,failures,first,until) VALUES (?,?,?,?) ON CONFLICT(source) DO UPDATE SET failures=excluded.failures,first=excluded.first,until=excluded.until",params![source,failures,first,until]);
-        let _=conn.execute("DELETE FROM login_attempts WHERE until<? AND first<?",params![now(),now()-LOGIN_WINDOW]);
-        return failure(StatusCode::UNAUTHORIZED,"密码错误");
+        record_failure(&conn,&source);
+        return failure(StatusCode::UNAUTHORIZED,"账号或密码错误");
     }
-    let _=conn.execute("DELETE FROM login_attempts WHERE source=?",[&source]);
+    clear_failures(&conn,&source);
     let Ok(raw)=random_bytes(32) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     let token=hex(&raw);
-    if conn.execute("INSERT INTO admin_sessions(hash,expires) VALUES (?,?)",params![digest(&token),now()+SESSION_LIFETIME]).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    let ua=headers.get(axum::http::header::USER_AGENT).and_then(|v|v.to_str().ok()).unwrap_or("");
+    let label=device(ua);
+    if conn.execute("INSERT INTO admin_sessions(hash,expires,created,source,device) VALUES (?,?,?,?,?)",params![digest(&token),now()+SESSION_LIFETIME,now(),source,label]).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    // 每次登录都发一条。不带后台地址：那是秘密，不该经过第三方。发不出去也不影响登录。
+    let path=state.db_path.to_string();
+    let text=format!("后台有新的登录\n设备：{label}\nIP：{source}");
+    tokio::spawn(async move {let _=send_telegram(&path,&text).await;});
     let mut response=Redirect::to(&access::admin_home()).into_response();
     let cookie=format!("{COOKIE_NAME}={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={SESSION_LIFETIME}");
     if let Ok(v)=cookie.parse(){response.headers_mut().insert(SET_COOKIE,v);} response
@@ -392,13 +597,156 @@ pub(super) async fn logout(State(state):State<App>,headers:HeaderMap,Form(form):
     }
     response
 }
+#[derive(Deserialize)]pub(super) struct Account {csrf:String,current:String,username:String,password:String,confirm:String}
+pub(super) async fn save_account(State(state):State<App>,headers:HeaderMap,Form(form):Form<Account>)->Response {
+    let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,&form.csrf){return StatusCode::FORBIDDEN.into_response();}
+    let Some((current,_))=session(&headers,&conn) else {return StatusCode::FORBIDDEN.into_response()};
+    if !can_manage(&conn,&current) {return failure(StatusCode::FORBIDDEN,"这台设备登录还不满 24 小时，不能改账号密码");}
+    let Some(name)=valid_username(&form.username) else {
+        return failure(StatusCode::BAD_REQUEST,"账号需要 1–32 位字母、数字或 . _ - @");
+    };
+    let change=!form.password.is_empty();
+    if change {
+        if form.password.chars().count()<PASSWORD_MIN {return failure(StatusCode::BAD_REQUEST,&format!("新密码至少 {PASSWORD_MIN} 位"));}
+        if form.password.len()>128 {return failure(StatusCode::BAD_REQUEST,"新密码太长");}
+        if form.password!=form.confirm {return failure(StatusCode::BAD_REQUEST,"两次输入的新密码不一样");}
+    }
+    // 这个表单收当前密码，等于第二个登录入口，所以限流和那把信号量一样都要走。
+    let source=client(&headers);
+    if locked(&conn,&source) {return failure(StatusCode::TOO_MANY_REQUESTS,"该地址失败次数过多，请十五分钟后再试");}
+    let Ok(Ok(permit))=tokio::time::timeout(Duration::from_secs(3),LOGIN_GATE.acquire()).await else {
+        return failure(StatusCode::TOO_MANY_REQUESTS,"请求太多，请稍后重试");
+    };
+    let current_ok=password_ok(&conn,&form.current);
+    drop(permit);
+    if !current_ok {
+        record_failure(&conn,&source);
+        return failure(StatusCode::UNAUTHORIZED,"当前密码不对");
+    }
+    clear_failures(&conn,&source);
+    drop(conn);
+    if store_account(&state.db_path,&name,change.then_some(form.password.as_str())).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    frame(&format!("<section class='card'><h1>已保存</h1><p>{}所有登录会话已注销。</p><p><a href='/admin/'>重新登录</a></p></section>",
+        if change {"账号和密码都改了，"} else {"账号改了，"})).into_response()
+}
+
+#[derive(Deserialize)]pub(super) struct Move {csrf:String,dir:String}
+fn direction(dir:&str)->Option<bool> {
+    match dir {"up"=>Some(true),"down"=>Some(false),_=>None}
+}
+pub(super) async fn move_node(Path(id):Path<String>,State(state):State<App>,headers:HeaderMap,Form(form):Form<Move>)->Response {
+    // id 会拼进跳转地址的锚点里，先把形状卡死。
+    if id.len()!=16||!id.bytes().all(|b|b.is_ascii_hexdigit()) {return StatusCode::NOT_FOUND.into_response();}
+    let Ok(mut conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,&form.csrf){return StatusCode::FORBIDDEN.into_response();}
+    let Some(up)=direction(&form.dir) else {return StatusCode::BAD_REQUEST.into_response()};
+    if move_row(&mut conn,"nodes","sort,name",&id,up).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    back_to("nodes",&format!("n-{id}"))
+}
+/// 只影响后台和公开页的展示顺序，agent 的探测任务照旧按 id 下发，不用通知 agent。
+pub(super) async fn move_monitor(Path(id):Path<i64>,State(state):State<App>,headers:HeaderMap,Form(form):Form<Move>)->Response {
+    let Ok(mut conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,&form.csrf){return StatusCode::FORBIDDEN.into_response();}
+    let Some(up)=direction(&form.dir) else {return StatusCode::BAD_REQUEST.into_response()};
+    if move_row(&mut conn,"monitors","sort,id",&id.to_string(),up).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    back_to("monitors",&format!("m-{id}"))
+}
+
+/// 发一条 Telegram，不等结果。
+fn notify(path:&str,text:String) {
+    let path=path.to_string();
+    tokio::spawn(async move {let _=send_telegram(&path,&text).await;});
+}
+
+pub(super) async fn download_backup(State(state):State<App>,headers:HeaderMap,Form(form):Form<Csrf>)->Response {
+    let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,&form.csrf){return StatusCode::FORBIDDEN.into_response();}
+    let (Ok(tag),Ok(stamp))=(new_secret(8),conn.query_row("SELECT strftime('%Y%m%d-%H%M','now','localtime')",[],|r|r.get::<_,String>(0))) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    // WAL 模式下直接读文件可能拿到不一致的快照；VACUUM INTO 出来的是一整份可用的库。
+    let temp=format!("{}.export-{tag}",state.db_path);
+    let made=conn.execute("VACUUM INTO ?",[&temp]);
+    drop(conn);
+    let data=made.ok().and_then(|_|std::fs::read(&temp).ok());
+    let _=std::fs::remove_file(&temp);
+    let Some(data)=data else {return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    notify(&state.db_path,"后台下载了一份备份".to_string());
+    let disposition=format!("attachment; filename=\"avalon-backup-{stamp}.db\"");
+    ([(axum::http::header::CONTENT_TYPE,"application/octet-stream".to_string()),(axum::http::header::CONTENT_DISPOSITION,disposition)],data).into_response()
+}
+
+fn part<'a>(parts:&'a [(String,Vec<u8>)],name:&str)->Option<&'a [u8]> {
+    parts.iter().find(|(key,_)|key==name).map(|(_,value)|value.as_slice())
+}
+/// 上传的得是完好的、我们自己的库才换上去。换之前清空里面的登录会话：
+/// 恢复以后所有设备都用备份里的账号密码重新登录。
+fn check_backup(path:&str)->Result<(),&'static str> {
+    let conn=Connection::open(path).map_err(|_|"打不开这个文件")?;
+    let health:String=conn.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(|_|"文件损坏")?;
+    if health!="ok" {return Err("文件损坏");}
+    let ours:i64=conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('nodes','admin_settings','admin_sessions')",[],|r|r.get(0)).map_err(|_|"文件损坏")?;
+    // 我们的库里没有触发器和视图，有就不是我们导出的，不收。
+    let extra:i64=conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type IN ('trigger','view')",[],|r|r.get(0)).map_err(|_|"文件损坏")?;
+    if ours!=3||extra>0 {return Err("这不是 Avalon 的备份文件");}
+    conn.execute("DELETE FROM admin_sessions",[]).map_err(|_|"文件损坏")?;
+    Ok(())
+}
+
+pub(super) async fn restore_backup(State(state):State<App>,headers:HeaderMap,body:axum::body::Bytes)->Response {
+    let content_type=headers.get(axum::http::header::CONTENT_TYPE).and_then(|v|v.to_str().ok()).unwrap_or("");
+    let Some(parts)=site::multipart(content_type,&body) else {return failure(StatusCode::BAD_REQUEST,"上传的数据格式不对，请重试");};
+    let csrf=part(&parts,"csrf").map(|v|String::from_utf8_lossy(v).into_owned()).unwrap_or_default();
+    let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,&csrf){return StatusCode::FORBIDDEN.into_response();}
+    drop(conn);
+    if part(&parts,"confirm").is_none() {return failure(StatusCode::BAD_REQUEST,"请先勾选「覆盖现有全部数据」");}
+    let Some(data)=part(&parts,"backup").filter(|data|!data.is_empty()) else {return failure(StatusCode::BAD_REQUEST,"请先选择备份文件");};
+    if !data.starts_with(b"SQLite format 3\0") {return failure(StatusCode::BAD_REQUEST,"这不是 Avalon 的备份文件");}
+    let pending=format!("{}.restore",state.db_path);
+    if std::fs::write(&pending,data).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    if let Err(message)=check_backup(&pending) {
+        let _=std::fs::remove_file(&pending);
+        return failure(StatusCode::BAD_REQUEST,message);
+    }
+    // 回完这一页再退出。Docker 的 restart 策略（或 systemd 的 Restart=）会把程序拉起来，启动时换上新库。
+    // 用非 0 退出码：systemd 只配了 Restart=on-failure 的也会重启。
+    let path=state.db_path.to_string();
+    tokio::spawn(async move {
+        let _=send_telegram(&path,"后台上传了备份，hub 正在重启换上它").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        std::process::exit(1);
+    });
+    frame("<section class='card'><h1>正在恢复</h1><p>hub 正在重启换上备份，大约十秒后刷新。账号密码用备份里的，后台地址也变回备份里的那个。</p></section>").into_response()
+}
+
+#[derive(Deserialize)]pub(super) struct Kick {csrf:String,target:String}
+pub(super) async fn kick(State(state):State<App>,headers:HeaderMap,Form(form):Form<Kick>)->Response {
+    let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,&form.csrf){return StatusCode::FORBIDDEN.into_response();}
+    let Some((current,_))=session(&headers,&conn) else {return StatusCode::FORBIDDEN.into_response()};
+    if !can_manage(&conn,&current) {return failure(StatusCode::FORBIDDEN,"这台设备登录还不满 24 小时，不能踢出别的设备");}
+    // 本机永远踢不掉自己，要走用退出登录。
+    let result=if form.target=="others" {
+        conn.execute("DELETE FROM admin_sessions WHERE hash<>?",[&current])
+    } else {
+        let Ok(id)=form.target.parse::<i64>() else {return StatusCode::BAD_REQUEST.into_response()};
+        conn.execute("DELETE FROM admin_sessions WHERE rowid=? AND hash<>?",params![id,current])
+    };
+    if result.is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    back("sessions")
+}
+
 #[derive(Deserialize)]pub(super) struct NewNode {csrf:String,name:String}
 pub(super) async fn add_node(State(state):State<App>,headers:HeaderMap,Form(form):Form<NewNode>)->Response {
     let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     if !authorized(&headers,&conn,&form.csrf) {return StatusCode::FORBIDDEN.into_response();}
     let name=form.name.trim();if name.is_empty()||name.len()>80 {return failure(StatusCode::BAD_REQUEST,"节点名称长度需在 1–80 字节之间");}
     let (Ok(id),Ok(token))=(new_secret(8),new_secret(32)) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
-    if conn.execute("INSERT INTO nodes(id,name,token,public) VALUES (?,?,?,1)",params![id,name,token]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    if conn.execute("INSERT INTO nodes(id,name,token,public,sort) VALUES (?,?,?,1,(SELECT COALESCE(MAX(sort),0)+1 FROM nodes))",params![id,name,token]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     let _=ping::attach_auto(&conn,&id);
     CONFIG_VERSION.fetch_add(1,Ordering::Relaxed);
     let command=install_command(&public_base(&headers),&id,&token);
@@ -432,7 +780,7 @@ pub(super) async fn edit_node(Path(id):Path<String>,State(state):State<App>,head
     match tx.execute("UPDATE nodes SET name=?,public=? WHERE id=?",params![name,form.public.is_some() as i32,id]) {Ok(1)=>(),Ok(_)=>return StatusCode::NOT_FOUND.into_response(),Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     let result=tx.execute("INSERT INTO node_config(node_id,country,display_ip,notify,remark,price,currency,billing_cycle,expires_at,traffic_limit,traffic_mode,traffic_reset_day,auto_renew) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET country=excluded.country,display_ip=excluded.display_ip,notify=excluded.notify,remark=excluded.remark,price=excluded.price,currency=excluded.currency,billing_cycle=excluded.billing_cycle,expires_at=excluded.expires_at,traffic_limit=excluded.traffic_limit,traffic_mode=excluded.traffic_mode,traffic_reset_day=excluded.traffic_reset_day,auto_renew=excluded.auto_renew",params![id,form.country.trim().to_uppercase(),form.display_ip.trim(),form.notify.is_some() as i32,form.remark.trim(),form.price,form.currency.trim(),form.billing_cycle.trim(),form.expires_at.trim(),limit.unwrap_or(0),mode,form.traffic_reset_day,form.auto_renew.is_some() as i32]);
     if result.is_err()||apply_fixes(&tx,&id,form.traffic_reset_day,fixes).is_err()||tx.commit().is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
-    Redirect::to(&access::admin_home()).into_response()
+    back(&format!("n-{id}"))
 }
 
 /// 换 token。旧凭据立刻失效，包括正连着的那条：hub 在下一轮循环里发现 token
@@ -490,7 +838,7 @@ pub(super) async fn add_monitor(State(state):State<App>,headers:HeaderMap,body:S
     let total:i64=conn.query_row("SELECT COUNT(*) FROM monitors",[],|r|r.get(0)).unwrap_or(0);
     if total>=ping::MAX_MONITORS {return failure(StatusCode::BAD_REQUEST,"监控数量已达上限");}
     let Ok(tx)=conn.transaction() else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
-    if tx.execute("INSERT INTO monitors(name,host,port,interval,auto_join,enabled) VALUES (?,?,?,?,?,1)",
+    if tx.execute("INSERT INTO monitors(name,host,port,interval,auto_join,enabled,sort) VALUES (?,?,?,?,?,1,(SELECT COALESCE(MAX(sort),0)+1 FROM monitors))",
         params![name,host,port,interval,!one(&fields,"auto_join").is_empty() as i32]).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -502,7 +850,7 @@ pub(super) async fn add_monitor(State(state):State<App>,headers:HeaderMap,body:S
     }
     if tx.commit().is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     CONFIG_VERSION.fetch_add(1,Ordering::Relaxed);
-    Redirect::to(&access::admin_home()).into_response()
+    back(&format!("m-{id}"))
 }
 
 pub(super) async fn edit_monitor(Path(id):Path<i64>,State(state):State<App>,headers:HeaderMap,body:String)->Response {
@@ -516,7 +864,7 @@ pub(super) async fn edit_monitor(Path(id):Path<i64>,State(state):State<App>,head
             .and_then(|_|tx.execute("DELETE FROM ping WHERE monitor_id=?",[id]));
         if removed.is_err()||tx.commit().is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
         CONFIG_VERSION.fetch_add(1,Ordering::Relaxed);
-        return Redirect::to(&access::admin_home()).into_response();
+        return back("monitors");
     }
     let name=one(&fields,"name").trim().to_string();
     let Some((host,port))=parse_target(one(&fields,"target")) else {return failure(StatusCode::BAD_REQUEST,"目标地址要写成 host:port，IPv6 写成 [地址]:端口");};
@@ -536,7 +884,7 @@ pub(super) async fn edit_monitor(Path(id):Path<i64>,State(state):State<App>,head
     }
     if tx.commit().is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     CONFIG_VERSION.fetch_add(1,Ordering::Relaxed);
-    Redirect::to(&access::admin_home()).into_response()
+    back(&format!("m-{id}"))
 }
 
 pub(super) async fn save_access(State(state):State<App>,headers:HeaderMap,body:String)->Response {
@@ -555,7 +903,7 @@ pub(super) async fn save_access(State(state):State<App>,headers:HeaderMap,body:S
         return failure(StatusCode::BAD_REQUEST,"展示页域名不能是你现在正在用的这个域名，否则保存后后台会立刻打不开。展示页请另用一个域名");
     }
     if access::save(&conn,&path,&display,!one(&fields,"public").is_empty()).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
-    Redirect::to(&access::admin_home()).into_response()
+    back("access")
 }
 
 pub(super) async fn save_site(State(state):State<App>,headers:HeaderMap,body:String)->Response {
@@ -565,19 +913,19 @@ pub(super) async fn save_site(State(state):State<App>,headers:HeaderMap,body:Str
     // 选项旁的「删除」按钮和「使用」在同一个表单里，按钮的 name 是 delete。
     if let Some(what)=Some(one(&fields,"delete")).filter(|v|!v.is_empty()) {
         return match site::delete(&conn,what) {
-            Ok(())=>Redirect::to(&access::admin_home()).into_response(),
+            Ok(())=>back("site"),
             Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
     }
     match one(&fields,"action") {
         "icon"=>return match site::choose(&conn,one(&fields,"icon")) {
-            Ok(true)=>Redirect::to(&access::admin_home()).into_response(),
+            Ok(true)=>back("site"),
             Ok(false)=>failure(StatusCode::BAD_REQUEST,"这个图标现在用不了：请先上传图片或设置表情"),
             Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         },
         "reset_icon"=>{
             if site::reset_icon(&conn).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
-            return Redirect::to(&access::admin_home()).into_response();
+            return back("site");
         }
         _=>{}
     }
@@ -590,7 +938,7 @@ pub(super) async fn save_site(State(state):State<App>,headers:HeaderMap,body:Str
     if let Some(emoji)=emoji {
         if site::save_emoji(&conn,&emoji).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     }
-    Redirect::to(&access::admin_home()).into_response()
+    back("site")
 }
 
 pub(super) async fn upload_icon(State(state):State<App>,headers:HeaderMap,body:axum::body::Bytes)->Response {
@@ -604,7 +952,7 @@ pub(super) async fn upload_icon(State(state):State<App>,headers:HeaderMap,body:a
     if data.len()>site::ICON_MAX {return failure(StatusCode::BAD_REQUEST,"图片不能超过 256 KB");}
     let Some(mime)=site::sniff(data) else {return failure(StatusCode::BAD_REQUEST,"只支持 PNG、JPG、GIF、WebP、ICO。SVG 能内嵌脚本，不收");};
     if site::save_icon(&conn,mime,data).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
-    Redirect::to(&access::admin_home()).into_response()
+    back("site")
 }
 
 #[derive(Deserialize)]pub(super) struct Settings {csrf:String,bot_token:String,chat_id:String,clear_token:Option<String>}
@@ -618,7 +966,7 @@ pub(super) async fn save_settings(State(state):State<App>,headers:HeaderMap,Form
     let Ok(tx)=conn.transaction() else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     if !token.is_empty()||form.clear_token.is_some(){let new=if form.clear_token.is_some(){""}else{token};if tx.execute("INSERT INTO admin_settings(key,value) VALUES('bot_token',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[new]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}}
     if tx.execute("INSERT INTO admin_settings(key,value) VALUES('chat_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[chat]).is_err()||tx.commit().is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
-    Redirect::to(&access::admin_home()).into_response()
+    back("telegram")
 }
 pub(super) async fn test_telegram(State(state):State<App>,headers:HeaderMap,Form(form):Form<Csrf>)->Response {
     let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
@@ -814,6 +1162,124 @@ mod tests {
         assert!(reminder("东京",date,3,true).contains("还剩 3 天。到期后仍在线会自动续期"));
         assert!(reminder("东京",date,0,false).contains("今天到期（2026-10-01），记得续费"));
         assert!(reminder("东京",date,-2,false).contains("已过期 2 天"));
+    }
+
+    /// 老数据库里没有 username 这一项，不写迁移也要能进得去。
+    #[test]
+    fn account_defaults_to_admin() {
+        let conn=Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE admin_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        assert_eq!(username(&conn),"admin","没存过账号时按 admin 算");
+        conn.execute("INSERT INTO admin_settings VALUES ('username','')",[]).unwrap();
+        assert_eq!(username(&conn),"admin","存成空的也回退到 admin");
+        conn.execute("UPDATE admin_settings SET value='merlin' WHERE key='username'",[]).unwrap();
+        assert_eq!(username(&conn),"merlin");
+    }
+
+    #[test]
+    fn account_shape() {
+        assert_eq!(valid_username("  merlin  "),Some("merlin".into()),"前后空格去掉");
+        assert_eq!(valid_username("a.b_c-d@e"),Some("a.b_c-d@e".into()));
+        assert_eq!(valid_username(""),None);
+        assert_eq!(valid_username("管理员"),None,"只收 ASCII");
+        assert_eq!(valid_username(&"a".repeat(33)),None,"最长 32 位");
+    }
+
+    /// 账号和密码都要对。两样错哪一样，调用方拿到的都是同一个 false，
+    /// 登录页也就只有「账号或密码错误」一句话可说。
+    #[test]
+    fn both_halves_must_match() {
+        let conn=Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE admin_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);").unwrap();
+        let salt=SaltString::encode_b64(&[7_u8;16]).unwrap();
+        let hash=Argon2::default().hash_password(b"correct horse battery",&salt).unwrap().to_string();
+        conn.execute("INSERT INTO admin_settings VALUES ('username','merlin')",[]).unwrap();
+        conn.execute("INSERT INTO admin_settings VALUES ('password',?)",[&hash]).unwrap();
+        assert!(credentials_ok(&conn,"merlin","correct horse battery"));
+        assert!(credentials_ok(&conn," merlin ","correct horse battery"),"账号两边的空格不算数");
+        assert!(!credentials_ok(&conn,"admin","correct horse battery"),"账号不对");
+        assert!(!credentials_ok(&conn,"merlin","correct horse"),"密码不对");
+        assert!(!credentials_ok(&conn,"admin","correct horse"),"两样都不对");
+        assert!(password_ok(&conn,"correct horse battery"));
+        assert!(!password_ok(&conn,""),"空密码进不来");
+    }
+
+    #[test]
+    fn only_our_own_backups_are_accepted() {
+        let dir=std::env::temp_dir();
+        let good=dir.join(format!("avalon-test-good-{}.db",std::process::id())).to_str().unwrap().to_string();
+        let _=std::fs::remove_file(&good);
+        Connection::open(&good).unwrap().execute_batch("CREATE TABLE nodes (id TEXT); CREATE TABLE admin_settings (key TEXT, value TEXT);
+            CREATE TABLE admin_sessions (hash TEXT, expires INTEGER); INSERT INTO admin_sessions VALUES ('x',1);").unwrap();
+        assert!(check_backup(&good).is_ok());
+        let left:i64=Connection::open(&good).unwrap().query_row("SELECT COUNT(*) FROM admin_sessions",[],|r|r.get(0)).unwrap();
+        assert_eq!(left,0,"换上去之前清空登录会话");
+        Connection::open(&good).unwrap().execute_batch("CREATE TRIGGER t AFTER INSERT ON nodes BEGIN DELETE FROM nodes; END;").unwrap();
+        assert!(check_backup(&good).is_err(),"带触发器的不收");
+        let _=std::fs::remove_file(&good);
+        let other=dir.join(format!("avalon-test-other-{}.db",std::process::id())).to_str().unwrap().to_string();
+        let _=std::fs::remove_file(&other);
+        Connection::open(&other).unwrap().execute_batch("CREATE TABLE something (x INTEGER);").unwrap();
+        assert!(check_backup(&other).is_err(),"别的库不收");
+        let _=std::fs::remove_file(&other);
+    }
+
+    #[test]
+    fn device_names() {
+        assert_eq!(device("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"),"iPhone · Safari");
+        assert_eq!(device("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"),"Windows · Edge");
+        assert_eq!(device("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"),"Android · Chrome");
+        assert_eq!(device(""),"未知设备");
+    }
+
+    /// 偷到密码的人刚登进来，不能反手把你踢掉。
+    #[test]
+    fn new_devices_cannot_kick() {
+        let conn=Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE admin_sessions (hash TEXT PRIMARY KEY, expires INTEGER NOT NULL, created INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '');").unwrap();
+        let later=now()+3600;
+        conn.execute("INSERT INTO admin_sessions(hash,expires,created) VALUES ('fresh',?,?)",params![later,now()-60]).unwrap();
+        assert!(can_manage(&conn,"fresh"),"只有它一个在线，刚登录也能管");
+        conn.execute("INSERT INTO admin_sessions(hash,expires,created) VALUES ('old',?,?)",params![later,now()-2*86400]).unwrap();
+        assert!(!can_manage(&conn,"fresh"),"有更早的设备在，新设备不能踢人");
+        assert!(can_manage(&conn,"old"),"满 24 小时的可以");
+        conn.execute("INSERT INTO admin_sessions(hash,expires,created) VALUES ('legacy',?,0)",[later]).unwrap();
+        assert!(can_manage(&conn,"legacy"),"升级前就登录着的算旧设备");
+    }
+
+    #[test]
+    fn swapping_neighbours() {
+        let order=["a","b","c"];
+        assert_eq!(swapped(&order,&"b",true),Some(vec!["b","a","c"]));
+        assert_eq!(swapped(&order,&"b",false),Some(vec!["a","c","b"]));
+        assert_eq!(swapped(&order,&"a",true),None,"第一个不能再上移");
+        assert_eq!(swapped(&order,&"c",false),None,"最后一个不能再下移");
+        assert_eq!(swapped(&order,&"x",true),None,"不存在的不动");
+    }
+
+    /// 老数据 sort 全是 0。第一次移动就要把整张表按当前顺序编好号，不然两个 0 对调还是 0。
+    #[test]
+    fn first_move_renumbers_everything() {
+        let mut conn=Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO nodes(id,name) VALUES ('z','c'),('x','a'),('y','b');").unwrap();
+        assert!(move_row(&mut conn,"nodes","sort,name","z",true).unwrap());
+        let order:Vec<(String,i64)>=conn.prepare("SELECT id,sort FROM nodes ORDER BY sort").unwrap()
+            .query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().map(Result::unwrap).collect();
+        assert_eq!(order,vec![(String::from("x"),1),(String::from("z"),2),(String::from("y"),3)]);
+        assert!(!move_row(&mut conn,"nodes","sort,name","x",true).unwrap(),"第一个再上移什么都不做");
+    }
+
+    /// ?open= 的值会进到 HTML 的 id 里，别的字符一律当没传。
+    #[test]
+    fn open_parameter_is_fenced_in() {
+        assert_eq!(opened(Some("site")),"site");
+        assert_eq!(opened(Some("n-0123456789abcdef")),"n-0123456789abcdef");
+        assert_eq!(opened(Some("\"><script>")),"");
+        assert_eq!(opened(Some("SITE")),"");
+        assert_eq!(opened(None),"");
+        assert!(card("site","站点",false,"x").contains("<details class=\"card\" id=\"site\">"));
+        assert!(card("site","站点",true,"x").contains("id=\"site\" open>"),"带上 open 属性才是展开的");
     }
 
     #[test]

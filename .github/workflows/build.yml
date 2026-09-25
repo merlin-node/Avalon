@@ -1,23 +1,28 @@
-# 推一个 v 开头的标签（例如 v0.3.0）就发版：
-#   1. 跑测试，不过就停
-#   2. 编译 x86_64 和 aarch64 两种架构的静态程序（musl，不依赖目标机器的 glibc 版本）
-#   3. 发布到 Releases，附 SHA256SUMS
-#   4. 打多架构 Docker 镜像推到 ghcr.io
-name: release
+# 每次推到 main：跑测试 → 编译 x86_64 和 ARM64 两种静态程序 → 打多架构镜像推到 ghcr.io。
+# 镜像标签是 latest 和 sha-提交号前七位。服务器上 docker compose pull 拿到的就是最新代码，
+# 服务器本身不用编译。新版有问题时，可以用 sha- 标签退回任意一次提交。
+name: build
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
   packages: write
+
+# 连续推好几次时只构建最后一次，不排长队
+concurrency:
+  group: build-main
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: 检查 Cargo.lock
+        run: test -f Cargo.lock || { echo "::error::仓库里缺 Cargo.lock，测试和构建都靠它锁定依赖版本"; exit 1; }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: 测试
@@ -55,8 +60,9 @@ jobs:
         with:
           name: bin-${{ matrix.arch }}
           path: dist/
+          retention-days: 7
 
-  release:
+  image:
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -66,17 +72,7 @@ jobs:
           pattern: bin-*
           path: dist
           merge-multiple: true
-      - name: 校验和
-        run: |
-          cd dist
-          chmod 755 probe-*
-          sha256sum probe-* > SHA256SUMS
-          cat SHA256SUMS
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
-
+      - run: chmod 755 dist/probe-*
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -84,9 +80,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # 镜像名必须全小写，仓库名里有大写字母时这一步把它转过来
+      # 镜像名必须全小写；sha 标签取提交号前七位
       - name: 镜像名
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          echo "SHORT=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -94,5 +92,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.IMAGE }}:${{ github.ref_name }}
             ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ env.SHORT }}

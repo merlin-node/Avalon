@@ -1,7 +1,7 @@
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use sha2::{Digest, Sha256};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -71,7 +71,7 @@ enum Up {
 
 #[derive(Serialize)]
 struct Node {
-    id: String, name: String, online: bool, last_seen: Option<i64>,
+    id: String, sort: usize, name: String, online: bool, last_seen: Option<i64>,
     cpu: f64, memory: f64, disk: f64, rx: f64, tx: f64, load: f64, uptime: u64,
     mem_used: u64, mem_total: u64, swap_used: u64, swap_total: u64,
     disk_used: u64, disk_total: u64, load5: f64, load15: f64,
@@ -152,6 +152,21 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     ])?;
     add_columns(conn, "details", &[("agent_version", "TEXT NOT NULL DEFAULT ''")])?;
     add_columns(conn, "traffic", &[("boot", "TEXT NOT NULL DEFAULT ''")])?;
+    // 排序。老数据全是 0，这时节点按名字、监控按 id 兜底；第一次点上下箭头时整张表重新编号。
+    add_columns(conn, "nodes", &[("sort", "INTEGER NOT NULL DEFAULT 0")])?;
+    add_columns(conn, "monitors", &[("sort", "INTEGER NOT NULL DEFAULT 0")])?;
+    // 登录设备列表用。升级前就登着的会话这几项是空的，显示成"未知"，最多七天自然过期。
+    add_columns(conn, "admin_sessions", &[
+        ("created", "INTEGER NOT NULL DEFAULT 0"),
+        ("source", "TEXT NOT NULL DEFAULT ''"),
+        ("device", "TEXT NOT NULL DEFAULT ''"),
+    ])?;
+    // 删掉的旧数据只是把页标成空闲，文件不会变小。改成增量整理模式，清理任务每小时顺手把空页还给磁盘。
+    // 老库要整个 VACUUM 一次才能切过去，只在升级后第一次启动时发生。
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    if mode != 2 {
+        conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+    }
     Ok(())
 }
 
@@ -382,10 +397,10 @@ fn read_nodes(path: &str, full: bool) -> rusqlite::Result<Vec<Node>> {
         LEFT JOIN latest l ON l.node_id=n.id
         LEFT JOIN details d ON d.node_id=n.id LEFT JOIN traffic t ON t.node_id=n.id
         LEFT JOIN node_config c ON c.node_id=n.id
-        WHERE n.public=1 ORDER BY n.name")?;
+        WHERE n.public=1 ORDER BY n.sort,n.name")?;
     let rows = stmt.query_map([], |r| {
         let seen: Option<i64> = r.get(2)?;
-        Ok(Node { id:r.get(0)?, name:r.get(1)?, online:seen.is_some_and(|t| now()-t < 30), last_seen:seen,
+        Ok(Node { id:r.get(0)?, sort:0, name:r.get(1)?, online:seen.is_some_and(|t| now()-t < 30), last_seen:seen,
             cpu:r.get::<_,Option<f64>>(3)?.unwrap_or(0.0), memory:r.get::<_,Option<f64>>(4)?.unwrap_or(0.0),
             disk:r.get::<_,Option<f64>>(5)?.unwrap_or(0.0), rx:r.get::<_,Option<f64>>(6)?.unwrap_or(0.0),
             tx:r.get::<_,Option<f64>>(7)?.unwrap_or(0.0), load:r.get::<_,Option<f64>>(8)?.unwrap_or(0.0),
@@ -429,7 +444,9 @@ fn read_nodes(path: &str, full: bool) -> rusqlite::Result<Vec<Node>> {
         }
     }
     // 月流量按真实 ID 算完再换成公开编号。
-    for node in &mut list {
+    // 公开页主题按 sort 字段排节点。以前从来没发这个字段，顺序是碰巧跟着接口走的。
+    for (index, node) in list.iter_mut().enumerate() {
+        node.sort = index + 1;
         node.id = public_id(&node.id);
         if !full {
             // 内核版本对得上已知漏洞就能定向攻击，agent 版本同理。访客看发行版名称就够了。
@@ -599,10 +616,34 @@ fn start_cleanup(path: Arc<str>) {
                 let _ = conn.execute("DELETE FROM traffic_day WHERE day<CAST(strftime('%s','now','localtime') AS INTEGER)/86400-35", []);
                 let _ = conn.execute("DELETE FROM admin_sessions WHERE expires<?", [at]);
                 let _ = conn.execute("DELETE FROM login_attempts WHERE until<? AND first<?", params![at, at - 900]);
+                // 把删出来的空页还给磁盘，再把 WAL 文件截短，数据库文件不会只涨不跌
+                let _ = conn.execute_batch("PRAGMA incremental_vacuum; PRAGMA wal_checkpoint(TRUNCATE);");
             }
             tokio::time::sleep(Duration::from_secs(3600)).await;
         }
     });
+}
+
+/// 后台「上传恢复」把新库放在 <库>.restore，然后退出让 Docker（或 systemd）把程序拉起来。
+/// 在这里、还没打开任何连接的时候换上去。换下来的旧库连同它的 WAL 留一份 <库>.before-restore，
+/// 恢复错了还能换回来。
+fn apply_pending_restore(path: &str) -> std::io::Result<()> {
+    let pending = format!("{path}.restore");
+    if !std::path::Path::new(&pending).exists() {
+        return Ok(());
+    }
+    let old = format!("{path}.before-restore");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{old}{suffix}"));
+    }
+    if std::path::Path::new(path).exists() {
+        std::fs::rename(path, &old)?;
+    }
+    let _ = std::fs::rename(format!("{path}-wal"), format!("{old}-wal"));
+    let _ = std::fs::remove_file(format!("{path}-shm"));
+    std::fs::rename(&pending, path)?;
+    println!("已换上上传的备份，原来的数据库留在 {old}");
+    Ok(())
 }
 
 fn option(args: &[String], flag: &str) -> Option<String> {
@@ -627,7 +668,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let id = new_secret(8)?; let token = new_secret(32)?;
             init_db(&path)?;
             let conn = db(&path)?;
-            conn.execute("INSERT INTO nodes(id,name,token,public) VALUES (?,?,?,?)",params![id,name,token,!args.contains(&"--private".to_string())])?;
+            conn.execute("INSERT INTO nodes(id,name,token,public,sort) VALUES (?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM nodes))",params![id,name,token,!args.contains(&"--private".to_string())])?;
             ping::attach_auto(&conn, &id)?;
             println!("节点 ID: {id}\nToken: {token}\n仅显示一次，请妥善保管。");
         }
@@ -657,10 +698,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Some("admin-setup") => {
             init_db(&path)?;
             let password = new_secret(16)?;
-            admin::set_password(&path,&password)?;
-            println!("管理员密码（仅显示一次）: {password}\n请访问 https://你的主域名{} 登录。", access::admin_home());
+            admin::set_credentials(&path,admin::DEFAULT_USER,&password)?;
+            println!("管理员账号: {}\n管理员密码（仅显示一次）: {password}\n请访问 https://你的主域名{} 登录，登录后在「账号」卡片里可以把两样都改掉。", admin::DEFAULT_USER, access::admin_home());
         }
         Some("serve") => {
+            apply_pending_restore(&path)?;
             init_db(&path)?;
             admin::start_checks(Arc::from(path.clone()));
             start_cleanup(Arc::from(path.clone()));
@@ -676,10 +718,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .route("/admin/access",post(admin::save_access))
                 .route("/admin/",get(admin::page))
                 .route("/admin/login",post(admin::login)).route("/admin/logout",post(admin::logout))
+                .route("/admin/account",post(admin::save_account))
+                .route("/admin/sessions",post(admin::kick))
+                .route("/admin/backup",post(admin::download_backup))
+                .route("/admin/backup/restore",post(admin::restore_backup).layer(DefaultBodyLimit::max(admin::RESTORE_MAX)))
                 .route("/admin/nodes",post(admin::add_node))
                 .route("/admin/nodes/{id}",post(admin::edit_node))
+                .route("/admin/nodes/{id}/move",post(admin::move_node))
                 .route("/admin/monitors",post(admin::add_monitor))
                 .route("/admin/monitors/{id}",post(admin::edit_monitor))
+                .route("/admin/monitors/{id}/move",post(admin::move_monitor))
                 .route("/admin/settings",post(admin::save_settings))
                 .route("/admin/site",post(admin::save_site))
                 .route("/admin/site/icon",post(admin::upload_icon))

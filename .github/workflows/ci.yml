@@ -1,9 +1,7 @@
-# 每次推送都跑一遍测试。和在 VPS 上 cargo test 是同一套，只是换成 GitHub 的机器跑。
+# 别人提 Pull Request 时跑一遍测试。推到 main 的测试在 build.yml 里，和构建一起跑。
 name: ci
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -17,4 +15,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: 测试
-        run: cargo test
+        run: cargo test --locked
