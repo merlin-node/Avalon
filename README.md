@@ -25,15 +25,49 @@
 
 需要一台 Linux 服务器和一个解析到它的域名。镜像由 GitHub 编好，服务器上不编译。
 
+没有 Docker 先装（已有就跳过）：
+
 ```sh
-curl -fsSL https://get.docker.com | sh        # 已装 Docker 就跳过
+curl -fsSL https://get.docker.com | sh
+```
+
+建目录，写入 `docker-compose.yml`：
+
+```sh
 mkdir -p /opt/avalon && cd /opt/avalon
-curl -fsSLO https://raw.githubusercontent.com/merlin-node/Avalon/main/docker-compose.yml
+cat > docker-compose.yml <<'EOF'
+services:
+  avalon:
+    image: ghcr.io/merlin-node/avalon:latest
+    container_name: avalon
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9911:9911"
+    volumes:
+      - avalon-data:/data
+    environment:
+      TZ: Asia/Shanghai
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  avalon-data:
+EOF
+```
+
+启动，建管理员账号：
+
+```sh
 docker compose up -d
 docker compose exec avalon probe-hub admin-setup
 ```
 
-最后一条打印账号 `admin` 和一个随机密码，密码**只显示一次**。时区默认 `Asia/Shanghai`，改 `docker-compose.yml` 里的 `TZ`。
+最后一条打印账号 `admin` 和一个随机密码，密码**只显示一次**。时区改 `TZ` 那一行，改完再 `docker compose up -d`。
 
 **反向代理**：hub 只监听 `127.0.0.1:9911`，用 Caddy、nginx 等反代到它并配好 HTTPS。必须透传 WebSocket，并带上 `X-Forwarded-Host` 和 `X-Forwarded-For`（Caddy 默认就会，nginx 要手动加）。用展示页域名时，两个域名都反代到这同一个端口。
 
