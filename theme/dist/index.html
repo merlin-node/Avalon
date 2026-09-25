@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <link rel="icon" href="/favicon.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <!-- LXGW WenKai Screen R, split into subsets by unicode-range and served from
+         the CDN. The preload is the subset holding the Latin and punctuation the
+         page shows before the CJK ones arrive. -->
+    <link rel="preconnect" href="https://gw.alipayobjects.com" crossorigin />
+    <link rel="preload" as="font" type="font/woff2" crossorigin href="https://gw.alipayobjects.com/os/k/font/files/lxgwwenkaiscreenr-subset-119.woff2" />
+    <link rel="stylesheet" href="/lxgwwenkai.css" />
+    <title>Monitor</title>
+    <!-- A phone paints its own bars over or beside the document, where no stylesheet
+         reaches. These together make the header run into the status bar instead of
+         stopping under it: the translucent style puts the page under the bar on iOS,
+         the two capable metas open this as an app rather than a tab, and theme-color
+         is what Chrome tints its bars with. All of them carry the header's --nav, so
+         bar and header read as one surface; App.tsx keeps the colour in step with the
+         theme, and index.css sets color-scheme so the bar's glyphs flip with it. -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="theme-color" content="#1c2127" />
+    <script>
+      // In head, so the dark page is dark on the first paint. Same rule as useTheme:
+      // only a stored preference moves either of these.
+      if (localStorage.getItem("theme") === "light") {
+        document.querySelector('meta[name="theme-color"]').content = "#f9f9f9"
+      } else {
+        document.documentElement.classList.add("dark")
+      }
+    </script>
+    <script type="module" crossorigin src="/assets/index-DwWtBjGK-r8.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Dk-QRnjm-r7.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

@@ -1,0 +1,23 @@
+# 从源码构建 hub 镜像，不依赖 GitHub 发布的程序。只带本机架构的 agent。
+FROM rust:1-alpine AS build
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked
+
+FROM alpine:3.20
+ARG TARGETARCH
+RUN apk add --no-cache tzdata \
+ && adduser -D -H -u 10001 probe \
+ && mkdir -p /data /usr/local/lib/probe \
+ && chown probe:probe /data
+COPY --from=build /src/target/release/probe-hub /usr/local/bin/probe-hub
+COPY --from=build /src/target/release/probe-agent /usr/local/lib/probe/probe-agent-linux-${TARGETARCH}
+RUN chmod 755 /usr/local/bin/probe-hub /usr/local/lib/probe/probe-agent-linux-*
+ENV AVALON_DB=/data/probe.db
+USER probe
+VOLUME /data
+EXPOSE 9911
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:9911/health || exit 1
+ENTRYPOINT ["/usr/local/bin/probe-hub"]
+CMD ["serve", "--listen", "0.0.0.0:9911", "--db", "/data/probe.db"]

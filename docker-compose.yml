@@ -1,0 +1,28 @@
+services:
+  avalon:
+    image: ghcr.io/merlin-node/avalon:latest
+    # 想从源码自己构建镜像时，注释掉上面一行，打开下面三行，然后 docker compose up -d --build
+    # build:
+    #   context: .
+    #   dockerfile: deploy/Dockerfile.source
+    container_name: avalon
+    restart: unless-stopped
+    # 只监听本机，公网访问由反向代理负责 HTTPS
+    ports:
+      - "127.0.0.1:9911:9911"
+    volumes:
+      - avalon-data:/data
+    environment:
+      # 「今日流量」和上午 9 点的到期提醒都按这个时区算
+      TZ: Asia/Shanghai
+    # 容器沙箱：文件系统只读（只有数据卷可写）、没有任何特权能力、不能提权
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  avalon-data:

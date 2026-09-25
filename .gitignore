@@ -1,0 +1,7 @@
+/target
+/dist
+theme/node_modules
+*.db
+*.db-wal
+*.db-shm
+*.bak

@@ -1,0 +1,98 @@
+# 推一个 v 开头的标签（例如 v0.3.0）就发版：
+#   1. 跑测试，不过就停
+#   2. 编译 x86_64 和 aarch64 两种架构的静态程序（musl，不依赖目标机器的 glibc 版本）
+#   3. 发布到 Releases，附 SHA256SUMS
+#   4. 打多架构 Docker 镜像推到 ghcr.io
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 测试
+        run: cargo test --locked
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # cross 在容器里编译，自带目标架构的 C 编译器（SQLite 和加密库都有 C 代码）
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: 编译
+        run: cross build --release --locked --target ${{ matrix.target }}
+      - name: 整理产物
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/probe-hub dist/probe-hub-linux-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/probe-agent dist/probe-agent-linux-${{ matrix.arch }}
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - name: 校验和
+        run: |
+          cd dist
+          chmod 755 probe-*
+          sha256sum probe-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # 镜像名必须全小写，仓库名里有大写字母时这一步把它转过来
+      - name: 镜像名
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:latest
