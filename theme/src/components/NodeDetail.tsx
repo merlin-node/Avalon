@@ -336,9 +336,9 @@ export function Latency({ id, className }: { id: number; className?: string }) {
             <ComposedChart data={pingRows}>
               <CartesianGrid strokeDasharray="3 3" className="stroke-border" vertical={false} />
               <XAxis {...timeAxis(pingRows, LATENCY_HOURS, from, to)} />
-              {/* Not anchored at zero: these lines live in a narrow band far from
-                  it, and zero flattens every wobble. */}
-              <YAxis unit="ms" width={52} domain={["auto", "auto"]} {...AXIS} />
+              {/* Anchored at zero like the other charts. Auto-fitting the band
+                  blew one or two milliseconds of normal jitter up into a saw. */}
+              <YAxis unit="ms" width={52} domain={[0, "auto"]} {...AXIS} />
               <Tooltip
                 labelFormatter={(ts) => new Date(Number(ts)).toLocaleString("zh-CN")}
                 // The line is drawn from what answered, so without this a bucket

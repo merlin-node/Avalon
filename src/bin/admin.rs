@@ -194,15 +194,68 @@ fn authorized(headers:&HeaderMap,conn:&Connection,csrf:&str)->bool {
     same_origin(headers) && session(headers,conn).is_some_and(|(_,expected)|equal_secret(&expected,csrf))
 }
 fn esc(s:&str)->String {s.replace('&',"&amp;").replace('<',"&lt;").replace('>',"&gt;").replace('"',"&quot;").replace('\'',"&#39;")}
+/// 后台的亮暗。后台不许跑脚本，所以按钮是提交表单，服务器记一个 cookie；
+/// 没选过就跟随系统。gate 在处理后台请求前按 cookie 设好，frame 直接读。
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub(super) enum Look {Auto,Light,Dark}
+tokio::task_local! { pub(super) static LOOK: Look; }
+pub(super) fn look_from(headers:&HeaderMap)->Look {
+    for value in headers.get_all(axum::http::header::COOKIE) {
+        let Ok(text)=value.to_str() else {continue};
+        for part in text.split(';') {
+            match part.trim() {"avalon_look=dark"=>return Look::Dark,"avalon_look=light"=>return Look::Light,_=>{}}
+        }
+    }
+    Look::Auto
+}
+
+/// 颜色全是变量。暗色取自现在公开页主题的暗色（theme/src/index.css），按钮蓝压深了一点让白字够清楚。
+/// 暗色写了两遍：一遍给"跟随系统"，一遍给"手动选了黑夜"。
+const ADMIN_CSS:&str=r#"
+:root{--bg:#f8fafb;--text:#242b30;--head:#fff;--line:#d9dfe3;--line-soft:#e3e8eb;--card:#fff;--field:#fff;--field-line:#cdd6dc;--label:#626e76;--link:#386a9c;--btn:#346d9b;--btn2:#e8edef;--btn2-text:#26333b;--danger:#b04747;--danger-line:#e0c4c4;--muted:#6d797f;--ok:#329356;--down:#c05252;--code:#f2f5f7;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#31363b;--text:#f1f1f1;--head:#1c2127;--line:#3a3e41;--line-soft:#30343a;--card:#1c1d26;--field:#22232e;--field-line:#4a4f55;--label:#aaaaaa;--link:#4992ff;--btn:#2d6cc8;--btn2:#303241;--btn2-text:#f1f1f1;--danger:#e0605c;--danger-line:#6b3b3b;--muted:#a3a3a3;--ok:#5fb865;--down:#e0605c;--code:#22232e;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#31363b;--text:#f1f1f1;--head:#1c2127;--line:#3a3e41;--line-soft:#30343a;--card:#1c1d26;--field:#22232e;--field-line:#4a4f55;--label:#aaaaaa;--link:#4992ff;--btn:#2d6cc8;--btn2:#303241;--btn2-text:#f1f1f1;--danger:#e0605c;--danger-line:#6b3b3b;--muted:#a3a3a3;--ok:#5fb865;--down:#e0605c;--code:#22232e;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,sans-serif}
+header{background:var(--head);border-bottom:1px solid var(--line);padding:14px max(16px,calc((100vw - 1050px)/2));display:flex;align-items:center;gap:24px}a{color:var(--link)}header a{text-decoration:none}main{max-width:1050px;margin:28px auto;padding:0 16px 60px}h1{font-size:21px;margin:0 0 15px}h2{font-size:16px;margin:0 0 12px}.card{background:var(--card);border:1px solid var(--line);padding:20px;margin:12px 0}.card>summary{font-size:16px;font-weight:700;margin:0}.card[open]>summary{margin:0 0 12px}.row{display:flex;gap:8px;align-items:flex-start}.row>details{flex:1;min-width:0}.move{display:flex;gap:4px;margin:0;flex:none}.move button{padding:2px 10px;min-width:34px}.ghost{visibility:hidden}.grow{flex:1;min-width:0}button:disabled{opacity:.45;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px}label{display:block;color:var(--label);font-size:13px}input,select{display:block;width:100%;border:1px solid var(--field-line);border-radius:0;padding:9px 10px;background:var(--field);color:var(--text);font:inherit;margin-top:5px}input[type=checkbox]{width:auto;display:inline-block;margin-right:5px}input[type=radio]{width:auto;display:inline-block;margin:0 5px 0 0;vertical-align:-1px}.icons{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}.icon-choice{display:flex;flex-direction:column;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);padding:10px 12px;cursor:pointer;min-width:96px;color:var(--text)}.icon-choice img{object-fit:contain}.upload{margin-top:22px;padding-top:16px;border-top:1px dashed var(--line-soft)}button.link{background:none;color:var(--danger);padding:0;font-size:13px}.icon-choice:has(input:checked){border-color:var(--btn);box-shadow:0 0 0 1px var(--btn)}button{background:var(--btn);color:#fff;border:0;border-radius:0;padding:10px 16px;cursor:pointer;font:inherit}button.secondary{background:var(--btn2);color:var(--btn2-text)}button.danger{background:var(--card);color:var(--danger);border:1px solid var(--danger-line)}form{margin:0}.actions{display:flex;gap:10px;align-items:center;margin-top:15px;flex-wrap:wrap}small,.muted{color:var(--muted)}.node{border-top:1px solid var(--line-soft);padding:15px 0}.node:first-child{border-top:0}details>summary{cursor:pointer;font-weight:650;font-size:15px}code{overflow-wrap:anywhere}.ok{color:var(--ok)}.down{color:var(--down)}.picker{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 12px;max-height:230px;overflow:auto;border:1px solid var(--line-soft);padding:10px;margin-top:6px}.picker label{color:var(--text)}.brand{display:flex;align-items:center;gap:8px}.brand img{object-fit:contain}.cmd{display:block;white-space:pre-wrap;word-break:break-all;background:var(--code);border:1px solid var(--line);padding:12px;margin:10px 0;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--text);-webkit-user-select:all;user-select:all}
+.look{margin-left:auto;display:flex}.look button{background:none;color:var(--text);padding:4px;border:0;display:grid;place-items:center}.look .to-light{display:none}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .look .to-light{display:grid}:root:not([data-theme="light"]) .look .to-dark{display:none}}
+:root[data-theme="dark"] .look .to-light{display:grid}:root[data-theme="dark"] .look .to-dark{display:none}
+@media(max-width:600px){main{margin:12px auto}.card{padding:14px}}
+"#;
+/// 月亮去黑夜，太阳回白天；当前是哪边就只露出另一边的按钮。
+const LOOK_BUTTONS:&str=r#"<button class="to-dark" name="to" value="dark" aria-label="切换到黑夜" title="黑夜"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button><button class="to-light" name="to" value="light" aria-label="切换到白天" title="白天"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>"#;
+
 fn frame(body:&str)->Html<String> {
     let site=site::escape(&site::name());
     // 页面里的后台链接和表单一律写成 /admin/…，在这里换成当前的后台地址。
     // 图标也走后台地址下的那份：用了展示页域名时，没登录的人在主域名上拿不到公开的 /favicon.png。
     let base=access::admin_base();
     let body=body.replace("\"/admin/",&format!("\"{base}/")).replace("'/admin/",&format!("'{base}/"));
-    Html(format!(r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{site} · 管理</title><style>
-:root{{color-scheme:light}}*{{box-sizing:border-box}}body{{margin:0;background:#f8fafb;color:#242b30;font:14px/1.6 system-ui,-apple-system,sans-serif}}
-header{{background:#fff;border-bottom:1px solid #d9dfe3;padding:14px max(16px,calc((100vw - 1050px)/2));display:flex;align-items:center;gap:24px}}a{{color:#386a9c}}header a{{text-decoration:none}}main{{max-width:1050px;margin:28px auto;padding:0 16px 60px}}h1{{font-size:21px;margin:0 0 15px}}h2{{font-size:16px;margin:0 0 12px}}.card{{background:#fff;border:1px solid #d9dfe3;padding:20px;margin:12px 0}}.card>summary{{font-size:16px;font-weight:700;margin:0}}.card[open]>summary{{margin:0 0 12px}}.row{{display:flex;gap:8px;align-items:flex-start}}.row>details{{flex:1;min-width:0}}.move{{display:flex;gap:4px;margin:0;flex:none}}.move button{{padding:2px 10px;min-width:34px}}.ghost{{visibility:hidden}}.grow{{flex:1;min-width:0}}button:disabled{{opacity:.45;cursor:not-allowed}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px}}label{{display:block;color:#626e76;font-size:13px}}input,select{{display:block;width:100%;border:1px solid #cdd6dc;border-radius:0;padding:9px 10px;background:#fff;color:#242b30;font:inherit;margin-top:5px}}input[type=checkbox]{{width:auto;display:inline-block;margin-right:5px}}input[type=radio]{{width:auto;display:inline-block;margin:0 5px 0 0;vertical-align:-1px}}.icons{{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}}.icon-choice{{display:flex;flex-direction:column;align-items:center;gap:6px;border:1px solid #d9dfe3;background:#fff;padding:10px 12px;cursor:pointer;min-width:96px;color:#242b30}}.icon-choice img{{object-fit:contain}}.upload{{margin-top:22px;padding-top:16px;border-top:1px dashed #e3e8eb}}button.link{{background:none;color:#b04747;padding:0;font-size:13px}}.icon-choice:has(input:checked){{border-color:#346d9b;box-shadow:0 0 0 1px #346d9b}}button{{background:#346d9b;color:white;border:0;border-radius:0;padding:10px 16px;cursor:pointer;font:inherit}}button.secondary{{background:#e8edef;color:#26333b}}button.danger{{background:#fff;color:#b04747;border:1px solid #e0c4c4}}form{{margin:0}}.actions{{display:flex;gap:10px;align-items:center;margin-top:15px;flex-wrap:wrap}}small,.muted{{color:#6d797f}}.node{{border-top:1px solid #e3e8eb;padding:15px 0}}.node:first-child{{border-top:0}}details>summary{{cursor:pointer;font-weight:650;font-size:15px}}code{{overflow-wrap:anywhere}}.ok{{color:#329356}}.down{{color:#c05252}}.picker{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 12px;max-height:230px;overflow:auto;border:1px solid #e3e8eb;padding:10px;margin-top:6px}}.picker label{{color:#242b30}}.brand{{display:flex;align-items:center;gap:8px}}.brand img{{object-fit:contain}}.cmd{{display:block;white-space:pre-wrap;word-break:break-all;background:#f2f5f7;border:1px solid #d9dfe3;padding:12px;margin:10px 0;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#242b30;-webkit-user-select:all;user-select:all}}@media(max-width:600px){{main{{margin:12px auto}}.card{{padding:14px}}}}</style><header><strong class="brand"><img src="{base}/icon" alt="" width="20" height="20">{site}</strong><a href="/">首页</a><span class="muted">管理</span></header><main>{body}</main></html>"#))
+    let look=match LOOK.try_with(|look|*look).unwrap_or(Look::Auto) {
+        Look::Light=>" data-theme=\"light\"", Look::Dark=>" data-theme=\"dark\"", Look::Auto=>"",
+    };
+    Html(format!(r#"<!doctype html><html lang="zh-CN"{look}><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{site} · 管理</title><style>{ADMIN_CSS}</style><header><strong class="brand"><img src="{base}/icon" alt="" width="20" height="20">{site}</strong><a href="/">首页</a><span class="muted">管理</span><form class="look" method="post" action="{base}/theme">{LOOK_BUTTONS}</form></header><main>{body}</main></html>"#))
+}
+
+/// 切换亮暗。只是个显示偏好，不用登录，但要求同源；切完回到刚才那一页。
+#[derive(Deserialize)] pub(super) struct LookChoice {to:String}
+pub(super) async fn set_look(headers:HeaderMap,Form(form):Form<LookChoice>)->Response {
+    if !same_origin(&headers) {return StatusCode::FORBIDDEN.into_response();}
+    let value=match form.to.as_str() {"dark"=>"dark","light"=>"light",_=>return StatusCode::BAD_REQUEST.into_response()};
+    let back=return_path(&headers).unwrap_or_else(access::admin_home);
+    let mut response=Redirect::to(&back).into_response();
+    if let Ok(cookie)=HeaderValue::from_str(&format!("avalon_look={value}; Path=/; Max-Age=31536000; SameSite=Lax; Secure; HttpOnly")) {
+        response.headers_mut().insert(SET_COOKIE,cookie);
+    }
+    response
+}
+/// 从 Referer 里取回刚才那一页。只认后台地址底下的路径，所以不会被拿来跳到别的网站。
+fn return_path(headers:&HeaderMap)->Option<String> {
+    let referer=headers.get(axum::http::header::REFERER)?.to_str().ok()?;
+    let rest=referer.split_once("://")?.1;
+    let path=&rest[rest.find('/')?..];
+    let home=access::admin_home();
+    path.starts_with(home.trim_end_matches('/')).then(|| path.to_string())
 }
 fn failure(code:StatusCode,message:&str)->Response {(code,frame(&format!("<p>{}</p><p><a href='/admin/'>返回管理</a></p>",esc(message)))).into_response()}
 
@@ -1252,6 +1305,25 @@ mod tests {
         assert_eq!(client_ip(&headers,false),"162.158.0.1","没走 Tunnel 不信这个头");
         headers.insert("cf-connecting-ip","not-an-ip".parse().unwrap());
         assert_eq!(client_ip(&headers,true),"162.158.0.1","不像地址就不用");
+    }
+
+    #[test]
+    fn look_comes_from_the_cookie() {
+        let mut headers=HeaderMap::new();
+        assert_eq!(look_from(&headers),Look::Auto,"没选过就跟随系统");
+        headers.insert(axum::http::header::COOKIE,"pulse_admin=abc; avalon_look=dark".parse().unwrap());
+        assert_eq!(look_from(&headers),Look::Dark);
+        headers.insert(axum::http::header::COOKIE,"avalon_look=light".parse().unwrap());
+        assert_eq!(look_from(&headers),Look::Light);
+        headers.insert(axum::http::header::COOKIE,"avalon_look=purple".parse().unwrap());
+        assert_eq!(look_from(&headers),Look::Auto,"不认识的值当没选");
+    }
+
+    /// 后台不许跑脚本，亮暗全靠样式：跟随系统和手动选黑夜两份暗色都得在。
+    #[test]
+    fn admin_css_has_both_dark_paths() {
+        assert!(ADMIN_CSS.contains("prefers-color-scheme:dark"));
+        assert!(ADMIN_CSS.contains(":root[data-theme=\"dark\"]{--bg:#31363b"));
     }
 
     #[test]

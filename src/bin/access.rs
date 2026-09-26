@@ -179,7 +179,9 @@ pub(super) async fn gate(State(state): State<App>, mut request: Request, next: N
         }
     };
     let admin = allowed && request.uri().path().starts_with("/admin");
-    let mut response = if allowed { next.run(request).await } else { StatusCode::NOT_FOUND.into_response() };
+    // 后台页面的亮暗按 cookie 定，处理请求期间 frame() 直接读得到。
+    let look = admin::look_from(request.headers());
+    let mut response = if allowed { admin::LOOK.scope(look, next.run(request)).await } else { StatusCode::NOT_FOUND.into_response() };
     // 后台以外，所有 4xx 都换成和「不存在」一模一样的空 404。框架自带的英文报错、400、405
     // 都会透露后面跑的是什么程序、哪个路径是真的。
     if !admin && response.status().is_client_error() {

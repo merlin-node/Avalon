@@ -758,6 +758,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .route("/admin/login",post(admin::login)).route("/admin/logout",post(admin::logout))
                 .route("/admin/account",post(admin::save_account))
                 .route("/admin/sessions",post(admin::kick))
+                .route("/admin/theme",post(admin::set_look))
                 .route("/admin/backup",post(admin::download_backup))
                 .route("/admin/backup/restore",post(admin::restore_backup).layer(DefaultBodyLimit::max(admin::RESTORE_MAX)))
                 .route("/admin/nodes",post(admin::add_node))
