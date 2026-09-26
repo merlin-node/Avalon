@@ -98,6 +98,8 @@ fn db(path: &str) -> rusqlite::Result<Connection> {
 
 fn init_db(path: &str) -> rusqlite::Result<()> {
     let conn = db(path)?;
+    // 新库还没有 nodes 表。只对新装生效的默认值要在建表之前判断。
+    let fresh: bool = conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes')", [], |r| r.get(0))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
         CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, name TEXT NOT NULL, token TEXT NOT NULL, public INTEGER NOT NULL DEFAULT 1, last_seen INTEGER);
         CREATE TABLE IF NOT EXISTS samples (node_id TEXT NOT NULL, ts INTEGER NOT NULL, cpu REAL NOT NULL, memory REAL NOT NULL, disk REAL NOT NULL, rx REAL NOT NULL, tx REAL NOT NULL, load REAL NOT NULL, uptime INTEGER NOT NULL);
@@ -126,6 +128,11 @@ fn init_db(path: &str) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS alert_state (key TEXT PRIMARY KEY, state INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS login_attempts (source TEXT PRIMARY KEY, failures INTEGER NOT NULL,
           first INTEGER NOT NULL, until INTEGER NOT NULL);")?;
+    // 新装默认关闭公开页：装好到你设置完之前，谁访问都是 404。
+    // 老库没有这一项时照旧按开放算，升级不会让已经在用的公开页突然消失。
+    if fresh {
+        conn.execute("INSERT OR IGNORE INTO admin_settings(key,value) VALUES('public_page','0')", [])?;
+    }
     ping::init(&conn)?;
     site::init(&conn)?;
     access::init(&conn)?;
@@ -252,8 +259,24 @@ fn clean_ip(value: Option<&str>, v6: bool) -> String {
         _ => String::new(),
     }
 }
-/// hub 看到的连接来源，取反代追加的 X-Forwarded-For 最右边那个。本机直连时没有这个头，返回空。
+/// compose 里声明了走 Cloudflare Tunnel。这时 hub 唯一的入口就是 Tunnel，
+/// CF-Connecting-IP 由 Cloudflare 边缘填写，才能拿来做登录封禁。
+pub(crate) fn behind_tunnel() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("AVALON_CF_TUNNEL").is_ok_and(|v| v == "1"))
+}
+/// Cloudflare 填的访客地址。只有一个，不用解析；不像地址就当没有。
+pub(crate) fn cf_ip(headers: &HeaderMap) -> Option<String> {
+    headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok())
+        .and_then(|text| text.trim().parse::<std::net::IpAddr>().ok()).map(|ip| ip.to_string())
+}
+/// hub 看到的节点出口地址，只在 agent 验过 token 之后用。有 Cloudflare 填的地址就用它
+/// （开小黄云或走 Tunnel 时，最坏也只是显示错，和极简探针的取舍一样）；
+/// 否则取反代追加的 X-Forwarded-For 最右边那个。本机直连时都没有，返回空。
 fn observed_ip(headers: &HeaderMap) -> String {
+    if let Some(ip) = cf_ip(headers) {
+        return ip;
+    }
     headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
         .and_then(|value| value.rsplit(',').next()).map(str::trim)
         .and_then(|text| text.parse::<std::net::IpAddr>().ok())
@@ -615,7 +638,7 @@ fn start_cleanup(path: Arc<str>) {
                 let _ = conn.execute("DELETE FROM ping WHERE ts<?", [at - ping::RETENTION]);
                 let _ = conn.execute("DELETE FROM traffic_day WHERE day<CAST(strftime('%s','now','localtime') AS INTEGER)/86400-35", []);
                 let _ = conn.execute("DELETE FROM admin_sessions WHERE expires<?", [at]);
-                let _ = conn.execute("DELETE FROM login_attempts WHERE until<? AND first<?", params![at, at - 900]);
+                let _ = conn.execute("DELETE FROM login_attempts WHERE until<? AND first<?", params![at, at - admin::LOGIN_WINDOW]);
                 // 把删出来的空页还给磁盘，再把 WAL 文件截短，数据库文件不会只涨不跌
                 let _ = conn.execute_batch("PRAGMA incremental_vacuum; PRAGMA wal_checkpoint(TRUNCATE);");
             }
@@ -690,6 +713,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             println!("展示页域名：{}", if display.is_empty() { "未设置（主域名同时做展示页）".to_string() } else { display });
             println!("公开页：{}", if access::public_enabled() { "开放" } else { "关闭" });
         }
+        Some("unban") => {
+            init_db(&path)?;
+            let cleared = db(&path)?.execute("DELETE FROM login_attempts", [])?;
+            println!("已解除全部登录封禁（{cleared} 条），马上可以再登录。");
+        }
         Some("access-reset") => {
             init_db(&path)?;
             access::reset(&db(&path)?)?;
@@ -744,7 +772,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("probe-hub listening on {listen}");
             axum::serve(listener, axum::ServiceExt::<Request>::into_make_service(service)).await?;
         }
-        _ => { eprintln!("用法: probe-hub serve [--listen 地址] [--db 路径]\n       probe-hub add-node 名称 [--private] [--db 路径]\n       probe-hub admin-setup [--db 路径]\n       probe-hub backup 目标路径 [--db 路径]\n       probe-hub access [--db 路径]        查看后台地址和访问设置\n       probe-hub access-reset [--db 路径]  忘了后台地址或把自己关在外面时用"); }
+        _ => { eprintln!("用法: probe-hub serve [--listen 地址] [--db 路径]\n       probe-hub add-node 名称 [--private] [--db 路径]\n       probe-hub admin-setup [--db 路径]\n       probe-hub backup 目标路径 [--db 路径]\n       probe-hub access [--db 路径]        查看后台地址和访问设置\n       probe-hub access-reset [--db 路径]  忘了后台地址或把自己关在外面时用\n       probe-hub unban [--db 路径]         解除登录封禁"); }
     }
     Ok(())
 }
@@ -799,6 +827,19 @@ mod tests {
         assert!(parse(r#"{"t":"zz","x":1}"#).is_none(), "新报文这个版本不认识");
         assert!(serde_json::from_str::<serde_json::Value>(r#"{"t":"zz"}"#).unwrap().get("t").is_some(), "但能认出它带类型字段，于是忽略而不是断开");
         assert!(matches!(parse(r#"{"t":"f","v4":"1.1.1.1"}"#), Some(Up::Facts { .. })));
+    }
+
+    #[test]
+    fn new_installs_start_with_the_public_page_closed() {
+        let path = std::env::temp_dir().join(format!("avalon-fresh-{}.db", std::process::id())).to_str().unwrap().to_string();
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+        init_db(&path).unwrap();
+        let read = || db(&path).unwrap().query_row("SELECT value FROM admin_settings WHERE key='public_page'", [], |r| r.get::<_, String>(0)).unwrap();
+        assert_eq!(read(), "0", "新装默认关闭");
+        db(&path).unwrap().execute("UPDATE admin_settings SET value='1' WHERE key='public_page'", []).unwrap();
+        init_db(&path).unwrap();
+        assert_eq!(read(), "1", "打开之后再启动不会被改回去");
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
     }
 
     #[test]

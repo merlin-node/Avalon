@@ -144,8 +144,8 @@ pub(super) async fn gate(State(state): State<App>, mut request: Request, next: N
     let host = admin::request_hosts(request.headers()).into_iter().next().unwrap_or_default();
     let display = display_domain();
     let on_display = !display.is_empty() && host == display;
-    // hub 只监听本机。没有 X-Forwarded-For 说明请求没经过反代，是本机直连的。
-    let local = !request.headers().contains_key("x-forwarded-for");
+    // 经过反代或 Tunnel 的请求一定带其中一个头；都没有才是容器里的健康检查。
+    let local = !request.headers().contains_key("x-forwarded-for") && !request.headers().contains_key("cf-connecting-ip");
     let route = classify(&path, &admin_path());
     let allowed = match route {
         Route::Admin(internal) => {
@@ -166,6 +166,8 @@ pub(super) async fn gate(State(state): State<App>, mut request: Request, next: N
         Route::Health => local,
         // 这两类只有 GET：别的方法回 405 也算露了底，统一 404。凭据对不对由各自的处理函数判断，不对同样 404。
         Route::Agent | Route::Install => !on_display && request.method() == Method::GET,
+        // 公开内容只读。别的方法回 405 等于承认「这个路径存在」。
+        Route::Public if request.method() != Method::GET && request.method() != Method::HEAD => false,
         Route::Public => {
             if on_display {
                 public_enabled()
@@ -178,6 +180,11 @@ pub(super) async fn gate(State(state): State<App>, mut request: Request, next: N
     };
     let admin = allowed && request.uri().path().starts_with("/admin");
     let mut response = if allowed { next.run(request).await } else { StatusCode::NOT_FOUND.into_response() };
+    // 后台以外，所有 4xx 都换成和「不存在」一模一样的空 404。框架自带的英文报错、400、405
+    // 都会透露后面跑的是什么程序、哪个路径是真的。
+    if !admin && response.status().is_client_error() {
+        response = StatusCode::NOT_FOUND.into_response();
+    }
     harden(&mut response, admin);
     response
 }
@@ -202,15 +209,33 @@ fn harden(response: &mut Response, admin: bool) {
     let headers = response.headers_mut();
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
+    // 只走 HTTPS。hub 永远在 HTTPS 反代后面；本机用 http 联调时浏览器会忽略这个头。
+    headers.insert("strict-transport-security", HeaderValue::from_static("max-age=31536000"));
     if admin {
         headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
         headers.insert("cache-control", HeaderValue::from_static("no-store"));
+        // 后台一行脚本都没有，干脆禁止执行任何脚本：哪天有东西被注入进页面，浏览器也不会跑它。
+        // 只允许本站的图片、页面里的内联样式、提交给本站的表单。
+        headers.insert("content-security-policy", HeaderValue::from_static(
+            "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_pages_cannot_run_scripts() {
+        let mut page = StatusCode::OK.into_response();
+        harden(&mut page, true);
+        let csp = page.headers().get("content-security-policy").unwrap().to_str().unwrap();
+        assert!(csp.contains("default-src 'none'") && !csp.contains("script-src"), "没有任何地方放行脚本");
+        assert!(page.headers().contains_key("strict-transport-security"));
+        let mut public = StatusCode::OK.into_response();
+        harden(&mut public, false);
+        assert!(!public.headers().contains_key("content-security-policy"), "公开页的主题要跑脚本，不加");
+    }
 
     #[test]
     fn hidden_admin_path_rewrites_and_blocks_the_old_one() {

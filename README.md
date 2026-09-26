@@ -15,38 +15,47 @@
 ## 安全
 
 - 可设**展示页域名**：这个域名上只有公开页；主域名上没登录的人看到的一律是 404
-- **后台地址**可自定义，原来的 `/admin` 变成 404；所有拒绝都是同样的空 404
+- **后台地址**可自定义，原来的 `/admin` 变成 404
+- 后台以外，所有拒绝和错误都是同样的空 404，看不出后面跑的是什么、哪个路径真实存在
+- 新装默认关闭公开页，设置好之前谁访问都是 404
 - 公开接口不含 IP、token、备注、真实节点编号、内核版本和监控目标
-- 账号 + 密码（argon2id）；同一 IP 15 分钟内错 5 次锁 15 分钟；所有写操作校验同源和 CSRF
+- hub 不监听任何对外端口，只通过 Cloudflare Tunnel 访问；扫服务器 IP 找不到它
+- 账号 + 密码（argon2id）；同一 IP 错 3 次封 48 小时，按 Cloudflare 提供的真实 IP 算；所有写操作校验同源和 CSRF
 - 登录不满 24 小时的设备不能踢人、不能改账号密码（只剩它一个在线时除外）
 - hub 容器只读、非 root、无特权；agent 以专用用户在 systemd 沙箱里运行
 
 ## 安装 hub
 
-需要一台 Linux 服务器和一个解析到它的域名。镜像由 GitHub 编好，服务器上不编译。
+需要一台 Linux 服务器和一个托管在 Cloudflare 的域名。hub 通过 Cloudflare Tunnel 对外：**不占用服务器任何端口**，不用配反代和证书，服务器上的其他网站不受影响。镜像由 GitHub 编好，服务器上不编译。
 
-没有 Docker 先装（已有就跳过）：
+**1. 在 Cloudflare 建 Tunnel**
+
+Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared，起个名字。页面给出的安装命令里，`--token` 后面那一长串就是密钥，复制下来。
+
+在这个 Tunnel 的 Public Hostname 里添加域名（用展示页域名的话两个都加），每个都填 Service `HTTP`、URL `avalon:9911`，其他选项不动，**HTTP Host Header 一定不要填**。域名原来有解析记录的，先到 DNS 里删掉，否则会报冲突。
+
+**2. 装 Docker**（已有就跳过）
 
 ```sh
 curl -fsSL https://get.docker.com | sh
 ```
 
-建目录，写入 `docker-compose.yml`：
+**3. 写配置并启动**
 
 ```sh
 mkdir -p /opt/avalon && cd /opt/avalon
+read -rsp "粘贴 Tunnel 密钥后回车: " t && echo "TUNNEL_TOKEN=$t" > .env && chmod 600 .env && unset t && echo
 cat > docker-compose.yml <<'EOF'
 services:
   avalon:
     image: ghcr.io/merlin-node/avalon:latest
     container_name: avalon
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:9911:9911"
     volumes:
       - avalon-data:/data
     environment:
       TZ: Asia/Shanghai
+      AVALON_CF_TUNNEL: "1"
     read_only: true
     tmpfs:
       - /tmp
@@ -55,26 +64,35 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: avalon-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?在 .env 里填 TUNNEL_TOKEN}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - avalon
+
 volumes:
   avalon-data:
 EOF
-```
-
-启动，建管理员账号：
-
-```sh
 docker compose up -d
 docker compose exec avalon probe-hub admin-setup
 ```
 
-最后一条打印账号 `admin` 和一个随机密码，密码**只显示一次**。时区改 `TZ` 那一行，改完再 `docker compose up -d`。
+第二行粘贴密钥时屏幕不显示，也不会进命令历史。最后一条打印账号 `admin` 和一个随机密码，密码**只显示一次**。时区改 `TZ` 那一行，改完再 `docker compose up -d`。
 
-**反向代理**：hub 只监听 `127.0.0.1:9911`，用 Caddy、nginx 等反代到它并配好 HTTPS。必须透传 WebSocket，并带上 `X-Forwarded-Host` 和 `X-Forwarded-For`（Caddy 默认就会，nginx 要手动加）。用展示页域名时，两个域名都反代到这同一个端口。
+不想用 Tunnel、要自己反代的：删掉 `tunnel` 那一段和 `AVALON_CF_TUNNEL`，给 avalon 加上 `ports: ["127.0.0.1:9911:9911"]`；反代要透传 WebSocket，并带上 `X-Forwarded-Host` 和 `X-Forwarded-For`。这时登录封禁按反代看到的地址算，开着小黄云就会封到 Cloudflare 的节点上，不推荐。
 
 **首次登录**打开 `https://你的域名/admin`，然后：
 
 1. 「账号」：改掉账号和密码，密码至少 12 位
-2. 「访问控制」：设一个只有你知道的后台地址，保存后马上收藏
+2. 「访问控制」：设一个只有你知道的后台地址，保存后马上收藏。公开页新装默认关闭，首页 404 是正常的，要展示就在这里勾上
 3. 「Telegram 通知」：填 Bot Token 和 Chat ID，发一条测试
 
 ## 添加节点
@@ -111,15 +129,16 @@ docker compose up -d
 
 ## 换机器
 
-新机器用**同一个域名**，被控机什么都不用改。
+被控机什么都不用改，它们认的是域名。
 
 1. 旧 hub 下载备份。早期 systemd 版用命令行：
    `runuser -u probe -- /usr/local/bin/probe-hub backup /tmp/avalon-backup.db --db /var/lib/linux-probe/probe.db`
-2. 域名解析改到新机器
-3. 新机器按上面装好 hub、配好反代，跑 `admin-setup` 登录
-4. 「备份」上传恢复，十秒后用**旧的**账号密码、**旧的**后台地址登录
-5. 被控机几分钟内自己重连上线
-6. 按下面删掉旧 hub
+2. 新机器按「安装 hub」装好，跑 `admin-setup` 登录。在 Tunnel 里加上域名、删掉旧解析的那一刻，访问就切到了新机器
+3. 「备份」上传恢复，十秒后用**旧的**账号密码、**旧的**后台地址登录
+4. 被控机几分钟内自己重连上线
+5. 按下面删掉旧 hub
+
+以后再换：新机器的 `.env` 用同一个 Tunnel 密钥，旧机器 `docker compose down` 即可。
 
 ## 卸载
 
@@ -129,11 +148,11 @@ docker compose up -d
 
 ```sh
 cd /opt/avalon && docker compose down -v
-docker image rm $(docker image ls -q ghcr.io/merlin-node/avalon)
+docker image rm $(docker image ls -q ghcr.io/merlin-node/avalon) $(docker image ls -q cloudflare/cloudflared)
 cd / && rm -rf /opt/avalon
 ```
 
-然后删掉反代里对应的站点。
+然后在 Cloudflare 的 Tunnels 里删掉这个 Tunnel。
 
 **hub（早期 systemd 版）**，先备份：
 
@@ -154,11 +173,11 @@ userdel probe
 - **忘了后台地址**：`docker compose exec avalon probe-hub access`
 - **把自己关在外面**（域名或后台地址设错）：`docker compose exec avalon probe-hub access-reset && docker compose restart`。恢复成 `/admin`、不分域名、公开页开放
 - **有人登了你的后台**：在旧设备的「登录设备」里踢掉他，再改密码；踢不动就直接跑 `admin-setup`
-- **提示登录失败过多**：等 15 分钟，或换个网络
+- **登录被封**（错了 3 次）：`docker compose exec avalon probe-hub unban`
 - **节点 token 泄露**：后台该节点点「重新生成 Token」，到那台机器上重跑新的安装命令
 - **页面打不开**：`docker compose ps` 看容器状态，`docker compose logs --tail 50 avalon` 看日志
 - **新版有问题**：把 `docker-compose.yml` 的 `image:` 改成 GitHub Packages 里上一个 `sha-xxxxxxx` 标签，再 `docker compose up -d`
-- **节点一直离线**：在节点上看 `systemctl status probe-agent --no-pager` 和 `journalctl -u probe-agent -n 50 --no-pager`。多半是连不上 hub 域名，重跑安装命令
+- **节点一直离线**：在节点上看 `systemctl status probe-agent --no-pager` 和 `journalctl -u probe-agent -n 50 --no-pager`。多半是连不上 hub 域名，重跑安装命令。也可能是节点 IP 被 Cloudflare 的人机验证拦了：在 Cloudflare 的安全规则里，让 `/api/agent/`、`/i/`、`/a/` 开头的路径跳过验证
 
 ## 数据保留
 

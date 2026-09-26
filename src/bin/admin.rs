@@ -17,10 +17,10 @@ const PASSWORD_MIN: usize = 12;
 const TRUST_AFTER: i64 = 86400;
 /// 上传恢复的大小上限。几十台机器、七天历史也就几十 MB；更大的库用命令行恢复。
 pub(super) const RESTORE_MAX: usize = 128 * 1024 * 1024;
-/// 同一来源地址 15 分钟内错 5 次即锁定该地址。旧版把计数存成一个全局值，
-/// 任何人持续错密码就能把管理员自己挡在门外。
-const LOGIN_WINDOW: i64 = 900;
-const LOGIN_TRIES: i64 = 5;
+/// 同一来源 48 小时内错 3 次，封 48 小时。按来源分开算：存成全局计数的话，
+/// 任何人持续错密码就能把管理员自己挡在门外。解封用 probe-hub unban。
+pub(super) const LOGIN_WINDOW: i64 = 48 * 3600;
+const LOGIN_TRIES: i64 = 3;
 static LOGIN_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 fn digest(s: &str) -> String {
@@ -32,7 +32,13 @@ fn random_bytes(n: usize) -> std::io::Result<Vec<u8>> {
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
 /// 登录限流的分桶依据。取 X-Forwarded-For 最右边那个：它是紧挨着 hub 的那一层
 /// 反代自己追加的，客户端伪造不了；反代没透传就退回单一桶，行为与旧版一致。
-fn client(headers:&HeaderMap)->String {
+fn client(headers:&HeaderMap)->String {client_ip(headers,behind_tunnel())}
+/// 走 Tunnel 时用 Cloudflare 填的访客地址。没走 Tunnel 时不信那个头：
+/// 能直连源站的人、甚至 Cloudflare Worker 都能伪造它（极简探针也因此不拿它做限流）。
+fn client_ip(headers:&HeaderMap,tunnel:bool)->String {
+    if tunnel {
+        if let Some(ip)=cf_ip(headers) {return ip;}
+    }
     headers.get("x-forwarded-for").and_then(|v|v.to_str().ok())
         .and_then(|value|value.rsplit(',').next()).map(str::trim)
         .filter(|v|!v.is_empty()&&v.len()<=45&&v.bytes().all(|b|b.is_ascii_hexdigit()||b==b'.'||b==b':'))
@@ -502,9 +508,8 @@ fn monitors_section(conn:&Connection,csrf:&str,open:&str)->String {
 pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):Query<Panel>)->Response {
     let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     let Some((current,csrf))=session(&headers,&conn) else {
-        let configured:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM admin_settings WHERE key='password')",[],|r|r.get(0)).unwrap_or(false);
-        let tip=if configured {"请输入 admin-setup 给出的账号和密码。"} else {"先在 VPS 执行：runuser -u probe -- /usr/local/bin/probe-hub admin-setup --db /var/lib/linux-probe/probe.db"};
-        return frame(&format!("<section class='card'><h1>管理员登录</h1><p>{}</p><form method='post' action='/admin/login'><label>账号<input name='username' maxlength='32' autocomplete='username' required></label><label>密码<input type='password' name='password' autocomplete='current-password' required></label><div class='actions'><button>登录</button></div></form></section>",esc(tip))).into_response();
+        // 登录页不写任何提示：它是能被访问到的页面里唯一不是 404 的，多一个字就多一条线索。
+        return frame("<section class='card'><h1>登录</h1><form method='post' action='/admin/login'><label>账号<input name='username' maxlength='32' autocomplete='username' required></label><label>密码<input type='password' name='password' autocomplete='current-password' required></label><div class='actions'><button>登录</button></div></form></section>").into_response();
     };
     let open=opened(query.open.as_deref());
     let manage=can_manage(&conn,&current);
@@ -559,7 +564,7 @@ pub(super) async fn login(State(state):State<App>,headers:HeaderMap,Form(form):F
     if !same_origin(&headers) {return failure(StatusCode::FORBIDDEN,"请求来源不正确");}
     let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     let source=client(&headers);
-    if locked(&conn,&source) {return failure(StatusCode::TOO_MANY_REQUESTS,"该地址登录失败次数过多，请十五分钟后再试");}
+    if locked(&conn,&source) {return failure(StatusCode::TOO_MANY_REQUESTS,"该地址登录失败次数过多，请 48 小时后再试");}
     // argon2 是故意算得慢的，同时只放一个进去；排队而不是直接拒绝，
     // 否则两个人同时点一下登录就有一个吃 429。
     let Ok(Ok(permit))=tokio::time::timeout(Duration::from_secs(3),LOGIN_GATE.acquire()).await else {
@@ -614,7 +619,7 @@ pub(super) async fn save_account(State(state):State<App>,headers:HeaderMap,Form(
     }
     // 这个表单收当前密码，等于第二个登录入口，所以限流和那把信号量一样都要走。
     let source=client(&headers);
-    if locked(&conn,&source) {return failure(StatusCode::TOO_MANY_REQUESTS,"该地址失败次数过多，请十五分钟后再试");}
+    if locked(&conn,&source) {return failure(StatusCode::TOO_MANY_REQUESTS,"该地址失败次数过多，请 48 小时后再试");}
     let Ok(Ok(permit))=tokio::time::timeout(Duration::from_secs(3),LOGIN_GATE.acquire()).await else {
         return failure(StatusCode::TOO_MANY_REQUESTS,"请求太多，请稍后重试");
     };
@@ -1222,6 +1227,17 @@ mod tests {
         Connection::open(&other).unwrap().execute_batch("CREATE TABLE something (x INTEGER);").unwrap();
         assert!(check_backup(&other).is_err(),"别的库不收");
         let _=std::fs::remove_file(&other);
+    }
+
+    #[test]
+    fn ban_key_follows_cloudflare_only_behind_the_tunnel() {
+        let mut headers=HeaderMap::new();
+        headers.insert("x-forwarded-for","1.1.1.1, 162.158.0.1".parse().unwrap());
+        headers.insert("cf-connecting-ip","203.0.113.9".parse().unwrap());
+        assert_eq!(client_ip(&headers,true),"203.0.113.9","走 Tunnel 用 Cloudflare 填的访客地址");
+        assert_eq!(client_ip(&headers,false),"162.158.0.1","没走 Tunnel 不信这个头");
+        headers.insert("cf-connecting-ip","not-an-ip".parse().unwrap());
+        assert_eq!(client_ip(&headers,true),"162.158.0.1","不像地址就不用");
     }
 
     #[test]
