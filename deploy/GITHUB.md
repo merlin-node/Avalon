@@ -1,61 +1,51 @@
 # 推送与发版
 
-仓库：`github.com/merlin-node/Avalon`
-镜像：`ghcr.io/merlin-node/avalon`
+仓库 `github.com/merlin-node/Avalon`，镜像 `ghcr.io/merlin-node/avalon`。
 
 ## 每次推送会发生什么
 
-推到 `main` 后，Actions 里的 **build** 自动：跑测试 → 编译 x86_64 和 ARM64 静态程序 → 打多架构镜像推到 `ghcr.io/merlin-node/avalon`，标签是：
+推到 `main` 后，Actions 里的 **build** 自动：编译公开页主题 → 跑测试 → 编译 x86_64 和 ARM64 程序 → 打镜像推到 ghcr，标签是 `latest` 和 `sha-提交号前七位`。大约 4 分钟。
 
-- `latest`：永远是最新一次推送
-- `sha-提交号前七位`：每次推送各一个，用来退回
+任何一步失败，后面都不会跑，`latest` 不会被坏代码覆盖。成功后到主控上 `cd /opt/avalon && docker compose pull && docker compose up -d`。
 
-大约 10–15 分钟跑完。之后服务器上：
+## 拿到更新包后推送
 
-```sh
-cd /opt/avalon
-docker compose pull && docker compose up -d
-```
-
-测试不过，后面的编译和镜像都不会跑，`latest` 不会被坏代码覆盖。
-
-## 日常推送
+更新包是一个 zip，里面是改过的文件，路径都是相对仓库根目录的。在一台装了 git 的机器上（不用编译，小机器也行），把 zip 放到 `/root`：
 
 ```sh
-git add -A
-git commit -m "改了什么"
+cd /root && rm -rf avalon-push && mkdir avalon-push && cd avalon-push
+git clone https://github.com/merlin-node/Avalon.git repo && cd repo
+unzip -o /root/avalon-update.zip
+git status --short
+git -c user.name=merlin-node -c user.email=zsfnrly@gmail.com commit -am "改了什么"
 git push
+cd /root && rm -rf avalon-push avalon-update.zip
 ```
 
-## 发一个正式版本（可选）
+- `git status` 列出的 `M` 就是这次改的文件，数量要和包里的对上
+- 推送时 Username 填 `merlin-node`，Password 粘贴 Bitwarden 里的 GitHub 令牌，屏幕不显示，直接回车
+- 看到 `main -> main` 就成功了，去 Actions 看 build 是不是绿的
+- 解压只会覆盖和新增文件，**不会删文件**。要删文件时会另外给一条 `git rm` 命令
 
-想在 Releases 页面留一个带版本号的下载，先把 `Cargo.toml` 里的 `version` 改大，提交推送，然后：
+## GitHub 令牌
 
-```sh
-git tag v0.3.0
-git push origin v0.3.0
-```
+推送用的令牌有效期 30 天，过期了推送会提示认证失败，重新建一个：
 
-Actions 里的 **release** 会发布程序文件（附 SHA256SUMS），并打一个 `v0.3.0` 标签的镜像。
+GitHub 右上角头像 → **Settings** → 最底下 **Developer settings** → **Personal access tokens** → **Fine-grained tokens** → **Generate new token**：
 
-## 第一次推送后
+- **Expiration**：30 days
+- **Repository access**：Only select repositories → 选 `Avalon`
+- **Permissions → Repositories**：点 **+** 加 **Contents** 和 **Workflows**，都改成 **Read and write**
+- 生成后复制 `github_pat_` 开头那串存进 Bitwarden，替换旧的
 
-打开仓库首页右侧的 **Packages → avalon → Package settings**，确认 **Visibility 是 Public**。否则服务器上 `docker compose pull` 会提示 `denied`。
+## Actions 红了怎么看
 
-## 新版有问题，退回上一个
+点开红叉的那一次 → 点红叉的任务 → 点红叉的那一步 → 看最后几十行。
 
-在 Packages 页面找到上一个能用的 `sha-xxxxxxx` 标签，把 `docker-compose.yml` 里的 `image:` 改成：
+## 退回上一个版本
 
-```yaml
-    image: ghcr.io/merlin-node/avalon:sha-xxxxxxx
-```
+仓库首页右侧 **Packages → avalon**，找上一个能用的 `sha-xxxxxxx` 标签，把主控 `docker-compose.yml` 里 `avalon:latest` 的 `latest` 换成它，`docker compose up -d`。修好后换回 `latest`。
 
-然后 `docker compose up -d`。修好之后再改回 `latest`。
+## 正式版本（可选）
 
-## 失败时
-
-打开 Actions 里红叉的那一次，点进失败的步骤看最后几十行。
-
-- **检查 Cargo.lock** 失败：仓库里缺 `Cargo.lock`，从能编译的机器上拷一份进仓库再推
-- **测试** 失败：代码有问题，看报错是哪个测试
-- **镜像** 那一步提示没有权限：仓库 Settings → Actions → General → Workflow permissions 选 **Read and write permissions**
+想在 Releases 页面留一个带版本号的下载：`Cargo.toml` 里的 `version` 改大，推送，然后 `git tag v0.3.0 && git push origin v0.3.0`。

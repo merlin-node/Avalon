@@ -116,6 +116,16 @@ fn clear_failures(conn:&Connection,source:&str) {
     let _=conn.execute("DELETE FROM login_attempts WHERE source=?",[source]);
 }
 
+/// 两个大写字母换成国旗表情（区域指示符号）。iPhone 上直接显示成国旗，一张图片都不用。
+fn flag_emoji(code:&str)->String {
+    if code.len()!=2||!code.bytes().all(|b|b.is_ascii_uppercase()) {return String::new();}
+    code.bytes().filter_map(|b|char::from_u32(0x1F1E6+u32::from(b-b'A'))).collect()
+}
+/// 被控连上来时 Cloudflare 告诉我们的国家，没有就是空。
+fn auto_country(conn:&Connection,id:&str)->String {
+    conn.query_row("SELECT country FROM node_net WHERE node_id=?",[id],|r|r.get(0)).unwrap_or_default()
+}
+
 /// 从浏览器标识粗略认出设备，只为在列表里分得清哪台是哪台，认不出也无妨。
 fn device(ua:&str)->String {
     // 顺序有讲究：iPhone 的标识里也有 Mac OS X，安卓的里也有 Linux，Edge 的里也有 Chrome 和 Safari。
@@ -531,9 +541,13 @@ pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):
         let status=if is_online {"<span class='ok'>在线</span>"} else {"<span class='down'>离线</span>"};
         let anchor=format!("n-{id}");
         let unfold=if open==anchor {" open"} else {""};
+        // 手填的国家优先，留空用自动识别的
+        let auto=auto_country(&conn,&id);
+        let flag={let f=flag_emoji(if country.is_empty() {&auto} else {&country}); if f.is_empty() {f} else {format!("{f} ")}};
+        let country_hint=if auto.is_empty() {"自动识别".to_string()} else {format!("自动：{auto}")};
         let arrows=mover(&format!("/admin/nodes/{}/move",esc(&id)),&csrf,index,count);
-        body.push_str(&format!(r#"<div class="node row"><details id="{anchor}"{unfold}><summary>{status}　{} <small>· {monitors} 个监控 · {}</small></summary><p class="muted">{}</p><p class="muted">安装命令</p><code class="cmd">{}</code><p class="muted">卸载：<code>{}</code></p><form method="post" action="/admin/nodes/{}"><input type="hidden" name="csrf" value="{}"><div class="grid">
-<label>名称<input name="name" value="{}" maxlength="80" required></label><label>国家/地区代码<input name="country" value="{}" maxlength="2" placeholder="HK"></label><label>手填 IP<input name="display_ip" value="{}" maxlength="100"></label><label>备注<input name="remark" value="{}" maxlength="300"></label><label>价格<input name="price" type="number" min="0" step="0.01" value="{}"></label><label>货币<input name="currency" value="{}" maxlength="8" placeholder="$"></label><label>计费周期{}</label><label>到期日期<input name="expires_at" type="date" value="{}"></label><label>每月额度（GB）<input name="traffic_limit" type="number" min="0" step="0.01" value="{}" placeholder="不限"></label><label>计算方式{}</label><label>流量重置日<input name="traffic_reset_day" type="number" min="1" max="31" value="{}"></label></div>
+        body.push_str(&format!(r#"<div class="node row"><details id="{anchor}"{unfold}><summary>{status}　{flag}{} <small>· {monitors} 个监控 · {}</small></summary><p class="muted">{}</p><p class="muted">安装命令</p><code class="cmd">{}</code><p class="muted">卸载：<code>{}</code></p><form method="post" action="/admin/nodes/{}"><input type="hidden" name="csrf" value="{}"><div class="grid">
+<label>名称<input name="name" value="{}" maxlength="80" required></label><label>国家/地区<input name="country" value="{}" maxlength="2" placeholder="{country_hint}"></label><label>手填 IP<input name="display_ip" value="{}" maxlength="100"></label><label>备注<input name="remark" value="{}" maxlength="300"></label><label>价格<input name="price" type="number" min="0" step="0.01" value="{}"></label><label>货币<input name="currency" value="{}" maxlength="8" placeholder="$"></label><label>计费周期{}</label><label>到期日期<input name="expires_at" type="date" value="{}"></label><label>每月额度（GB）<input name="traffic_limit" type="number" min="0" step="0.01" value="{}" placeholder="不限"></label><label>计算方式{}</label><label>流量重置日<input name="traffic_reset_day" type="number" min="1" max="31" value="{}"></label></div>
 <details><summary class="muted">流量校正</summary><div class="grid">
 <label>总下行（GB）<input name="fix_total_rx" type="number" min="0" step="0.01" placeholder="现在 {}"></label><label>总上行（GB）<input name="fix_total_tx" type="number" min="0" step="0.01" placeholder="现在 {}"></label>
 <label>本期下行（GB）<input name="fix_month_rx" type="number" min="0" step="0.01" placeholder="现在 {}"></label><label>本期上行（GB）<input name="fix_month_tx" type="number" min="0" step="0.01" placeholder="现在 {}"></label></div></details><div class="actions"><label><input type="checkbox" name="public" value="1" {}>公开显示</label><label><input type="checkbox" name="notify" value="1" {}>掉线/到期通知</label><label><input type="checkbox" name="auto_renew" value="1" {}>到期后仍在线自动续期</label><button>保存节点</button><button class="secondary" name="action" value="rotate" formnovalidate>重新生成 Token</button><label><input type="checkbox" name="confirm" value="1">确认</label><button class="danger" name="action" value="delete" formnovalidate>删除节点</button></div></form></details>{arrows}</div>"#,
@@ -1238,6 +1252,15 @@ mod tests {
         assert_eq!(client_ip(&headers,false),"162.158.0.1","没走 Tunnel 不信这个头");
         headers.insert("cf-connecting-ip","not-an-ip".parse().unwrap());
         assert_eq!(client_ip(&headers,true),"162.158.0.1","不像地址就不用");
+    }
+
+    #[test]
+    fn flags_from_country_codes() {
+        assert_eq!(flag_emoji("HK"),"🇭🇰");
+        assert_eq!(flag_emoji("US"),"🇺🇸");
+        assert_eq!(flag_emoji("hk"),"","只收大写");
+        assert_eq!(flag_emoji(""),"");
+        assert_eq!(flag_emoji("USA"),"");
     }
 
     #[test]

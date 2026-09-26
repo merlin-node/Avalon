@@ -162,6 +162,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // 排序。老数据全是 0，这时节点按名字、监控按 id 兜底；第一次点上下箭头时整张表重新编号。
     add_columns(conn, "nodes", &[("sort", "INTEGER NOT NULL DEFAULT 0")])?;
     add_columns(conn, "monitors", &[("sort", "INTEGER NOT NULL DEFAULT 0")])?;
+    // 自动识别的国家，来自被控连上来时 Cloudflare 附带的 CF-IPCountry。手填的在 node_config.country，优先用手填的。
+    add_columns(conn, "node_net", &[("country", "TEXT NOT NULL DEFAULT ''")])?;
     // 登录设备列表用。升级前就登着的会话这几项是空的，显示成"未知"，最多七天自然过期。
     add_columns(conn, "admin_sessions", &[
         ("created", "INTEGER NOT NULL DEFAULT 0"),
@@ -269,6 +271,13 @@ pub(crate) fn behind_tunnel() -> bool {
 pub(crate) fn cf_ip(headers: &HeaderMap) -> Option<String> {
     headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok())
         .and_then(|text| text.trim().parse::<std::net::IpAddr>().ok()).map(|ip| ip.to_string())
+}
+/// Cloudflare 附带的国家码，只在 agent 验过 token 之后用。不调第三方接口、不放 IP 库文件，
+/// 被控每次连上来就是它当前出口的国家。XX 是查不到，T1 是 Tor，都当没有。
+pub(crate) fn cf_country(headers: &HeaderMap) -> String {
+    let code = headers.get("cf-ipcountry").and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_ascii_uppercase();
+    let shape = code.len() == 2 && code.bytes().all(|b| b.is_ascii_uppercase());
+    if shape && code != "XX" && code != "T1" { code } else { String::new() }
 }
 /// hub 看到的节点出口地址，只在 agent 验过 token 之后用。有 Cloudflare 填的地址就用它
 /// （开小黄云或走 Tunnel 时，最坏也只是显示错，和极简探针的取舍一样）；
@@ -415,11 +424,11 @@ fn read_nodes(path: &str, full: bool) -> rusqlite::Result<Vec<Node>> {
         (SELECT rx FROM traffic_day WHERE node_id=n.id AND day=CAST(strftime('%s','now','localtime') AS INTEGER)/86400),
         (SELECT tx FROM traffic_day WHERE node_id=n.id AND day=CAST(strftime('%s','now','localtime') AS INTEGER)/86400),
         0,0,
-        c.country,c.price,c.currency,c.billing_cycle,c.expires_at,c.traffic_limit,c.traffic_mode,c.traffic_reset_day,d.agent_version
+        COALESCE(NULLIF(c.country,''),net.country),c.price,c.currency,c.billing_cycle,c.expires_at,c.traffic_limit,c.traffic_mode,c.traffic_reset_day,d.agent_version
         FROM nodes n LEFT JOIN samples s ON s.rowid = (SELECT rowid FROM samples WHERE node_id=n.id ORDER BY ts DESC,rowid DESC LIMIT 1)
         LEFT JOIN latest l ON l.node_id=n.id
         LEFT JOIN details d ON d.node_id=n.id LEFT JOIN traffic t ON t.node_id=n.id
-        LEFT JOIN node_config c ON c.node_id=n.id
+        LEFT JOIN node_config c ON c.node_id=n.id LEFT JOIN node_net net ON net.node_id=n.id
         WHERE n.public=1 ORDER BY n.sort,n.name")?;
     let rows = stmt.query_map([], |r| {
         let seen: Option<i64> = r.get(2)?;
@@ -505,7 +514,8 @@ async fn agent(Path(id): Path<String>, State(state): State<App>, headers: Header
     }
     let Ok(ws) = ws else { return StatusCode::NOT_FOUND.into_response() };
     let observed = observed_ip(&headers);
-    ws.on_upgrade(move |socket| receive(socket, state.db_path, id, token, observed)).into_response()
+    let country = cf_country(&headers);
+    ws.on_upgrade(move |socket| receive(socket, state.db_path, id, token, observed, country)).into_response()
 }
 
 /// 旧版 agent 直接发裸 Metrics，没有 `t` 字段。留一条兼容路径，hub 可以先升级。
@@ -569,12 +579,12 @@ fn store_metrics(tx: &Connection, id: &str, at: i64, m: &Metrics, last_sample: &
 
 /// 一条 agent 连接的生命周期。连接内复用一个 SQLite 连接：旧版每收一帧就 open 一次，
 /// 200 个节点 5 秒一报就是每秒 40 次打开 + WAL 恢复，纯属浪费。
-async fn receive(mut socket: WebSocket, db_path: Arc<str>, id: String, token: String, observed: String) {
+async fn receive(mut socket: WebSocket, db_path: Arc<str>, id: String, token: String, observed: String, country: String) {
     let Ok(mut conn) = db(&db_path) else { return };
-    // 每次连上都记下出口地址：家宽换了 IP，重连时这里就是新的。
+    // 每次连上都记下出口地址和国家：家宽换了 IP，重连时这里就是新的。这次没带国家就保留上次的。
     let _ = conn.execute(
-        "INSERT INTO node_net(node_id,observed,updated) VALUES (?,?,?) ON CONFLICT(node_id) DO UPDATE SET observed=excluded.observed,updated=excluded.updated",
-        params![id, observed, now()]);
+        "INSERT INTO node_net(node_id,observed,country,updated) VALUES (?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET observed=excluded.observed,country=CASE WHEN excluded.country!='' THEN excluded.country ELSE node_net.country END,updated=excluded.updated",
+        params![id, observed, country, now()]);
     let mut version = 0_u64;               // 与 CONFIG_VERSION 初值 1 不同，首轮即下发
     let mut allowed: HashMap<i64,i64> = HashMap::new();
     let mut last_ping: HashMap<i64,i64> = HashMap::new();
@@ -827,6 +837,18 @@ mod tests {
         assert!(parse(r#"{"t":"zz","x":1}"#).is_none(), "新报文这个版本不认识");
         assert!(serde_json::from_str::<serde_json::Value>(r#"{"t":"zz"}"#).unwrap().get("t").is_some(), "但能认出它带类型字段，于是忽略而不是断开");
         assert!(matches!(parse(r#"{"t":"f","v4":"1.1.1.1"}"#), Some(Up::Facts { .. })));
+    }
+
+    #[test]
+    fn country_comes_from_cloudflare_and_ignores_junk() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(cf_country(&headers), "", "没有这个头就是没有");
+        headers.insert("cf-ipcountry", "hk".parse().unwrap());
+        assert_eq!(cf_country(&headers), "HK");
+        for junk in ["XX", "T1", "USA", "1A", ""] {
+            headers.insert("cf-ipcountry", junk.parse().unwrap());
+            assert_eq!(cf_country(&headers), "", "{junk} 不算国家");
+        }
     }
 
     #[test]
