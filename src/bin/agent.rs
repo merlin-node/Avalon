@@ -3,14 +3,14 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use tungstenite::{Message, WebSocket};
 
 /// 单个节点最多运行的监控数，与 hub 一致。hub 已经截断过，这里是第二道闸。
 const MAX_TASKS: usize = 64;
@@ -276,33 +276,44 @@ fn local_addresses() -> (Option<String>, Option<String>) {
 
 type HubSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
-/// 连 hub。本机没有公网 IPv4（在 NAT 后面，比如双栈家宽）时强制走 IPv4：
-/// 双栈机器默认优先用 IPv6，hub 就只看得到 v6，家宽的出口 IPv4 永远报不出来。
-/// 极简探针也是这么修的。IPv4 走不通（纯 v6 机器）就退回系统默认的连法。
+/// 连 hub，每一步都有时限：TCP 连接 10 秒，TLS 和 WebSocket 握手 15 秒。
+/// 以前用 tungstenite::connect，它的连接和握手都不设超时：网络断在握手中途、对面又没回 RST 时
+/// 会一直卡住。2026-09-26 大鸡断网恢复后，本机被控就这样卡了 9 分钟，手动重启才回来。
+/// 本机没有公网 IPv4（在 NAT 后面，比如双栈家宽）时先试 IPv4：双栈机器默认优先 IPv6，
+/// hub 就只看得到 v6，家宽的出口 IPv4 永远报不出来（极简探针也是这么修的）。
 fn open_hub(url: &url::Url, token: &str) -> Result<HubSocket, Box<dyn Error>> {
-    let request = || -> Result<tungstenite::handshake::client::Request, Box<dyn Error>> {
+    let host = url.host_str().ok_or("hub 地址缺少主机名")?;
+    let port = url.port_or_known_default().ok_or("hub 地址缺少端口")?;
+    let addresses = dial_order((host, port).to_socket_addrs()?.collect(), local_addresses().0.is_none());
+    let mut last: Box<dyn Error> = "解析不到 hub 的地址".into();
+    for address in addresses {
         let mut request = url.as_str().into_client_request()?;
         request.headers_mut().insert("Authorization", format!("Bearer {token}").parse()?);
-        Ok(request)
-    };
-    if local_addresses().0.is_none() {
-        if let Some(socket) = via_ipv4(url, request()?) {
-            return Ok(socket);
+        match dial(address, request) {
+            Ok(socket) => return Ok(socket),
+            Err(error) => last = error,
         }
     }
-    Ok(connect(request()?)?.0)
+    Err(last)
 }
 
-fn via_ipv4(url: &url::Url, request: tungstenite::handshake::client::Request) -> Option<HubSocket> {
-    let host = url.host_str()?;
-    let port = url.port_or_known_default()?;
-    let address = (host, port).to_socket_addrs().ok()?.find(|address| address.is_ipv4())?;
-    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(10)).ok()?;
-    let _ = stream.set_nodelay(true);
-    // 握手期间别无限等；连上之后主循环会换成自己的读超时。
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
-    tungstenite::client_tls(request, stream).ok().map(|(socket, _)| socket)
+/// 拨号顺序：在 NAT 后面时 IPv4 排前面，其余保持系统给的顺序（排序是稳定的）。
+fn dial_order(mut addresses: Vec<SocketAddr>, prefer_v4: bool) -> Vec<SocketAddr> {
+    if prefer_v4 {
+        addresses.sort_by_key(|address| !address.is_ipv4());
+    }
+    addresses
+}
+
+fn dial(address: SocketAddr, request: tungstenite::handshake::client::Request) -> Result<HubSocket, Box<dyn Error>> {
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))?;
+    stream.set_nodelay(true)?;
+    // 读写都有时限，握手卡住 15 秒就放弃、换下一个地址。连上之后主循环会把读超时换成自己的；
+    // 写超时一直保留，对面死掉时发送也不会永远卡住。
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    let (socket, _) = tungstenite::client_tls(request, stream).map_err(|error| error.to_string())?;
+    Ok(socket)
 }
 
 fn hub_tcp_latency(url: &url::Url) -> Option<f64> {
@@ -575,6 +586,15 @@ mod tests {
     fn hub_urls_have_a_port() {
         let url = url::Url::parse("wss://hub.example.com/api/agent/0123456789abcdef").unwrap();
         assert_eq!(url.port_or_known_default(), Some(443));
+    }
+
+    #[test]
+    fn nat_hosts_try_ipv4_first() {
+        let v6: SocketAddr = "[2606:4700::1]:443".parse().unwrap();
+        let v4a: SocketAddr = "104.21.0.1:443".parse().unwrap();
+        let v4b: SocketAddr = "172.67.0.1:443".parse().unwrap();
+        assert_eq!(dial_order(vec![v6, v4a, v4b], true), vec![v4a, v4b, v6], "NAT 后面：IPv4 先，其余顺序不变");
+        assert_eq!(dial_order(vec![v6, v4a], false), vec![v6, v4a], "有公网 IPv4：按系统给的顺序");
     }
 
     #[test]
