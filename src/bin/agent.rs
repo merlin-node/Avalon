@@ -274,6 +274,37 @@ fn local_addresses() -> (Option<String>, Option<String>) {
     (v4, v6)
 }
 
+type HubSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+/// 连 hub。本机没有公网 IPv4（在 NAT 后面，比如双栈家宽）时强制走 IPv4：
+/// 双栈机器默认优先用 IPv6，hub 就只看得到 v6，家宽的出口 IPv4 永远报不出来。
+/// 极简探针也是这么修的。IPv4 走不通（纯 v6 机器）就退回系统默认的连法。
+fn open_hub(url: &url::Url, token: &str) -> Result<HubSocket, Box<dyn Error>> {
+    let request = || -> Result<tungstenite::handshake::client::Request, Box<dyn Error>> {
+        let mut request = url.as_str().into_client_request()?;
+        request.headers_mut().insert("Authorization", format!("Bearer {token}").parse()?);
+        Ok(request)
+    };
+    if local_addresses().0.is_none() {
+        if let Some(socket) = via_ipv4(url, request()?) {
+            return Ok(socket);
+        }
+    }
+    Ok(connect(request()?)?.0)
+}
+
+fn via_ipv4(url: &url::Url, request: tungstenite::handshake::client::Request) -> Option<HubSocket> {
+    let host = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    let address = (host, port).to_socket_addrs().ok()?.find(|address| address.is_ipv4())?;
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(10)).ok()?;
+    let _ = stream.set_nodelay(true);
+    // 握手期间别无限等；连上之后主循环会换成自己的读超时。
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
+    tungstenite::client_tls(request, stream).ok().map(|(socket, _)| socket)
+}
+
 fn hub_tcp_latency(url: &url::Url) -> Option<f64> {
     let host = url.host_str()?;
     let port = url.port_or_known_default()?;
@@ -434,10 +465,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut next_latency = Instant::now();
 
     loop {
-        let mut request = url.as_str().into_client_request()?;
-        request.headers_mut().insert("Authorization", format!("Bearer {token}").parse()?);
-        match connect(request) {
-            Ok((mut socket, _)) => {
+        match open_hub(&url, &token) {
+            Ok(mut socket) => {
                 eprintln!("已连接到 hub");
                 set_read_timeout(&socket, POLL);
                 // 断线期间攒下的结果按 hub 的收报时间落库会错位，直接丢掉。
@@ -540,6 +569,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 强制走 IPv4 时要自己拼端口，wss 默认 443 得靠 url 库认出来。
+    #[test]
+    fn hub_urls_have_a_port() {
+        let url = url::Url::parse("wss://hub.example.com/api/agent/0123456789abcdef").unwrap();
+        assert_eq!(url.port_or_known_default(), Some(443));
+    }
 
     #[test]
     fn linux_metrics_are_finite() {
