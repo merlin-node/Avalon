@@ -225,6 +225,14 @@ header{background:var(--head);border-bottom:1px solid var(--line);padding:14px m
 /// 月亮去黑夜，太阳回白天；当前是哪边就只露出另一边的按钮。
 const LOOK_BUTTONS:&str=r#"<button class="to-dark" name="to" value="dark" aria-label="切换到黑夜" title="黑夜"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button><button class="to-light" name="to" value="light" aria-label="切换到白天" title="白天"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>"#;
 
+/// 点亮暗按钮时在浏览器里直接换颜色，再在后台把选择告诉服务器记住，不用整页重载。
+/// 后台禁止一切脚本，只有这一段靠内容指纹放行（access.rs 的 CSP）：改一个字指纹就不对，
+/// 浏览器会拒绝执行，按钮自动退回原来的"提交表单、服务器重发页面"。改了这段必须同步改指纹。
+pub(super) const LOOK_SCRIPT:&str=r#"document.querySelector("form.look").addEventListener("submit",function(e){var b=e.submitter;if(!b)return;e.preventDefault();document.documentElement.setAttribute("data-theme",b.value);fetch(this.action,{method:"POST",body:new URLSearchParams({to:b.value}),redirect:"manual",credentials:"same-origin"})})"#;
+/// LOOK_SCRIPT 的 SHA-256，测试里核对，防止改了脚本忘了改指纹。
+#[cfg(test)]
+const LOOK_SCRIPT_SHA256:&str="b9089a62f92f90b833ee2445058a21acd54be6c51793d04100f0873386d37e44";
+
 fn frame(body:&str)->Html<String> {
     let site=site::escape(&site::name());
     // 页面里的后台链接和表单一律写成 /admin/…，在这里换成当前的后台地址。
@@ -234,7 +242,7 @@ fn frame(body:&str)->Html<String> {
     let look=match LOOK.try_with(|look|*look).unwrap_or(Look::Auto) {
         Look::Light=>" data-theme=\"light\"", Look::Dark=>" data-theme=\"dark\"", Look::Auto=>"",
     };
-    Html(format!(r#"<!doctype html><html lang="zh-CN"{look}><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{site} · 管理</title><style>{ADMIN_CSS}</style><header><strong class="brand"><img src="{base}/icon" alt="" width="20" height="20">{site}</strong><a href="/">首页</a><span class="muted">管理</span><form class="look" method="post" action="{base}/theme">{LOOK_BUTTONS}</form></header><main>{body}</main></html>"#))
+    Html(format!(r#"<!doctype html><html lang="zh-CN"{look}><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{site} · 管理</title><style>{ADMIN_CSS}</style><header><strong class="brand"><img src="{base}/icon" alt="" width="20" height="20">{site}</strong><a href="/">首页</a><span class="muted">管理</span><form class="look" method="post" action="{base}/theme">{LOOK_BUTTONS}</form><script>{LOOK_SCRIPT}</script></header><main>{body}</main></html>"#))
 }
 
 /// 切换亮暗。只是个显示偏好，不用登录，但要求同源；切完回到刚才那一页。
@@ -1305,6 +1313,13 @@ mod tests {
         assert_eq!(client_ip(&headers,false),"162.158.0.1","没走 Tunnel 不信这个头");
         headers.insert("cf-connecting-ip","not-an-ip".parse().unwrap());
         assert_eq!(client_ip(&headers,true),"162.158.0.1","不像地址就不用");
+    }
+
+    #[test]
+    fn look_script_matches_its_fingerprint() {
+        use sha2::{Digest, Sha256};
+        let hex:String=Sha256::digest(LOOK_SCRIPT.as_bytes()).iter().map(|b|format!("{b:02x}")).collect();
+        assert_eq!(hex,LOOK_SCRIPT_SHA256,"改了亮暗切换脚本，要同步改这里和 access.rs 里 CSP 的指纹");
     }
 
     #[test]

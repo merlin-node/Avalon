@@ -541,10 +541,8 @@ fn store_metrics(tx: &Connection, id: &str, at: i64, m: &Metrics, last_sample: &
     if at - *last_sample >= 60 {
         tx.execute("INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?)",
             params![id,at,m.cpu,m.memory,m.disk,m.rx,m.tx,m.load,m.uptime as i64])?;
-        if let Some(latency) = m.latency_ms {
-            // agent → hub 的握手延迟作为内置监控 0，没配任何监控时也有一条线可看。
-            ping::write(tx, id, ping::HUB_MONITOR, at, Some(latency))?;
-        }
+        // 被控还会报一个到主控的握手延迟（latency_ms），不再存也不再画：主控在 Cloudflare 后面，
+        // 握手对象其实是离节点最近的 Cloudflare 机房，数值没有意义。Komari、极简探针都没有这个指标。
         *last_sample = at;
     }
     if m.mem_total > 0 {

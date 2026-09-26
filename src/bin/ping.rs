@@ -144,10 +144,8 @@ pub(super) async fn history(
     Path(id): Path<String>,
     Query(window): Query<Window>,
     State(state): State<App>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // 「Agent → Hub」那条线反映的是各节点到 hub 的网络距离，等于变相透露 hub 在哪。只给管理员看。
-    let full = access::admin_view(&state.db_path, &headers);
     let hours = match window.hours.unwrap_or(24) {
         hours @ (1 | 6 | 24 | 168) => i64::from(hours),
         _ => return Err(StatusCode::BAD_REQUEST),
@@ -190,7 +188,8 @@ pub(super) async fn history(
     let mut totals: HashMap<i64, (i64, i64)> = HashMap::new();
     for row in rows {
         let Ok((monitor, ts, average, low, high, lost, count)) = row else { continue };
-        if monitor == HUB_MONITOR && !full {
+        // 以前存下的"Agent → Hub"老数据（3 天内会自然清掉）谁都不给看，登录了也一样
+        if monitor == HUB_MONITOR {
             continue;
         }
         let entry = totals.entry(monitor).or_insert((0, 0));

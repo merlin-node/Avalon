@@ -224,7 +224,7 @@ fn harden(response: &mut Response, admin: bool) {
         // 后台一行脚本都没有，干脆禁止执行任何脚本：哪天有东西被注入进页面，浏览器也不会跑它。
         // 只允许本站的图片、页面里的内联样式、提交给本站的表单。
         headers.insert("content-security-policy", HeaderValue::from_static(
-            "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"));
+            "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'sha256-uQiaYvkvkLgz7iRFBYohrNVL5sUXk9BBAPCHM4bTfkQ='; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"));
     }
 }
 
@@ -247,7 +247,11 @@ mod tests {
         let mut page = StatusCode::OK.into_response();
         harden(&mut page, true);
         let csp = page.headers().get("content-security-policy").unwrap().to_str().unwrap();
-        assert!(csp.contains("default-src 'none'") && !csp.contains("script-src"), "没有任何地方放行脚本");
+        assert!(csp.contains("default-src 'none'"));
+        // 脚本只放行亮暗切换那一段的指纹，不许出现通配或内联放行
+        let scripts=csp.split(';').find(|part|part.trim_start().starts_with("script-src")).unwrap();
+        assert_eq!(scripts.split_whitespace().count(),2,"script-src 后面只能有一个指纹");
+        assert!(scripts.contains("'sha256-") && !scripts.contains("unsafe"),"只能按指纹放行，不许放行任意内联脚本");
         assert!(page.headers().contains_key("strict-transport-security"));
         let mut public = StatusCode::OK.into_response();
         harden(&mut public, false);
