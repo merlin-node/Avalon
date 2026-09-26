@@ -192,4 +192,4 @@ userdel probe
 
 ## 开发
 
-推到 `main` 会自动测试并构建镜像 `ghcr.io/merlin-node/avalon`，详见 [`deploy/GITHUB.md`](deploy/GITHUB.md)。
+推到 `main` 会自动编译公开页主题、测试并构建镜像 `ghcr.io/merlin-node/avalon`，详见 [`deploy/GITHUB.md`](deploy/GITHUB.md)。公开页的源码在 `theme/src`，改完推送即可，说明见 [`theme/INTEGRATION.md`](theme/INTEGRATION.md)。

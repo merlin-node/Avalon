@@ -1,6 +1,7 @@
 /target
 /dist
 theme/node_modules
+theme/dist
 *.db
 *.db-wal
 *.db-shm

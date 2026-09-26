@@ -1,8 +1,16 @@
 # 从源码构建 hub 镜像，不依赖 GitHub 发布的程序。只带本机架构的 agent。
+FROM node:24-alpine AS theme
+WORKDIR /theme
+COPY theme/package.json theme/package-lock.json ./
+RUN npm ci
+COPY theme/ ./
+RUN npm run build
+
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY . .
+COPY --from=theme /theme/dist theme/dist
 RUN cargo build --release --locked
 
 FROM alpine:3.20

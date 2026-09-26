@@ -23,6 +23,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: 检查 Cargo.lock
         run: test -f Cargo.lock || { echo "::error::仓库里缺 Cargo.lock，测试和构建都靠它锁定依赖版本"; exit 1; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: theme/package-lock.json
+      # 公开页主题从 theme/ 的源码构建，产物不进仓库，hub 编译时把它嵌进去
+      - name: 构建主题
+        working-directory: theme
+        run: npm ci && npm run build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: 测试
@@ -41,6 +50,15 @@ jobs:
             arch: arm64
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: theme/package-lock.json
+      # 公开页主题从 theme/ 的源码构建，产物不进仓库，hub 编译时把它嵌进去
+      - name: 构建主题
+        working-directory: theme
+        run: npm ci && npm run build
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

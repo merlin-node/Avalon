@@ -1,9 +1,0 @@
-{
-  "name": "Monitor",
-  "short_name": "Monitor",
-  "start_url": "/",
-  "scope": "/",
-  "display": "standalone",
-  "background_color": "#31363b",
-  "icons": [{ "src": "/favicon.png", "sizes": "200x200", "type": "image/png" }]
-}

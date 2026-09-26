@@ -209,6 +209,11 @@ fn harden(response: &mut Response, admin: bool) {
     let headers = response.headers_mut();
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
+    // 空 404 没有内容类型，又带着上面的 nosniff，Safari 会把它当成文件弹出下载。
+    // 统一标成纯文本，浏览器显示一片空白。
+    if !headers.contains_key(axum::http::header::CONTENT_TYPE) {
+        headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    }
     // 只走 HTTPS。hub 永远在 HTTPS 反代后面；本机用 http 联调时浏览器会忽略这个头。
     headers.insert("strict-transport-security", HeaderValue::from_static("max-age=31536000"));
     if admin {
@@ -224,6 +229,16 @@ fn harden(response: &mut Response, admin: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_404_is_plain_text_not_a_download() {
+        let mut missing = StatusCode::NOT_FOUND.into_response();
+        harden(&mut missing, false);
+        assert_eq!(missing.headers().get("content-type").unwrap(), "text/plain; charset=utf-8");
+        let mut page = ([("content-type", "text/html; charset=utf-8")], "x").into_response();
+        harden(&mut page, true);
+        assert_eq!(page.headers().get("content-type").unwrap(), "text/html; charset=utf-8", "已有的不覆盖");
+    }
 
     #[test]
     fn admin_pages_cannot_run_scripts() {

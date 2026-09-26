@@ -545,7 +545,7 @@ pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):
         if bot {"已保存，留空则不修改"} else {"123456:ABC..."},esc(&chat));
     let here=request_hosts(&headers).into_iter().next().unwrap_or_default();
     // 常看的排前面，默认也只展开「节点」；设一次就不动的几张收在下面。
-    let page=format!("<h1>节点管理</h1>{}{}{}{}{}{}{}{}{}{}<form method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"secondary\">退出登录</button></form>",
+    let page=format!("<h1>控制台</h1>{}{}{}{}{}{}{}{}{}{}<form method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"secondary\">退出登录</button></form>",
         card("add-node","添加节点",open=="add-node",&add_node),
         card("nodes","节点",open.is_empty()||open=="nodes"||open.starts_with("n-"),&body),
         card("add-monitor","添加监控",open=="add-monitor",&monitor_form(&conn,&csrf,None,"","",60,false,&HashSet::new())),
