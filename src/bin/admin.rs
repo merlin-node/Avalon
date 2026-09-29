@@ -165,8 +165,11 @@ pub(super) fn session(headers:&HeaderMap,conn:&Connection) -> Option<(String,Str
 /// 会把 Host 改写成上游地址 127.0.0.1:9911，这时原始域名在 X-Forwarded-Host 里——
 /// Caddy 默认就会带上。hub 只监听回环，这两个头只可能由本机反代写入；而跨站的
 /// 表单提交设不了自定义请求头，所以多认一个 X-Forwarded-Host 不削弱 CSRF 防护。
-pub(super) fn request_hosts(headers:&HeaderMap)->Vec<String> {
-    ["x-forwarded-host",HOST.as_str()].iter()
+pub(super) fn request_hosts(headers:&HeaderMap)->Vec<String> {hosts_from(headers,behind_tunnel())}
+/// 走隧道时只看 Host：隧道会把浏览器访问的域名原样放在 Host 里，而 X-Forwarded-Host
+/// 是请求者自己就能写的，不理它。自己反代时反代会改写 Host，才需要从 X-Forwarded-Host 拿原始域名。
+fn hosts_from(headers:&HeaderMap,tunnel:bool)->Vec<String> {
+    ["x-forwarded-host",HOST.as_str()].iter().skip(usize::from(tunnel))
         .filter_map(|name|headers.get(*name).and_then(|v|v.to_str().ok()))
         // 经过多层代理时是逗号分隔的列表，第一个是浏览器最初访问的。
         .filter_map(|value|value.split(',').next())
@@ -1348,6 +1351,15 @@ mod tests {
         assert_eq!(flag_emoji("hk"),"","只收大写");
         assert_eq!(flag_emoji(""),"");
         assert_eq!(flag_emoji("USA"),"");
+    }
+
+    #[test]
+    fn tunnel_ignores_forwarded_host() {
+        let mut headers=HeaderMap::new();
+        headers.insert(HOST,"test.example.com".parse().unwrap());
+        headers.insert("x-forwarded-host","evil.example.com".parse().unwrap());
+        assert_eq!(hosts_from(&headers,true),vec!["test.example.com"],"走隧道：请求者自己写的 X-Forwarded-Host 不算");
+        assert_eq!(hosts_from(&headers,false)[0],"evil.example.com","自己反代：反代写的 X-Forwarded-Host 优先");
     }
 
     #[test]
