@@ -619,7 +619,8 @@ pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):
     }
     if count==0 {body.push_str("<p class=\"muted\">还没有节点。</p>");}
     let add_node=format!(r#"<form method="post" action="/admin/nodes"><input type="hidden" name="csrf" value="{csrf}"><label>节点名称<input name="name" maxlength="80" required></label><div class="actions"><button>创建并显示 Agent 凭据</button></div></form>"#);
-    let telegram=format!(r#"<form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid"><label>Bot Token<input type="password" name="bot_token" autocomplete="off" placeholder="{}"></label><label>Chat ID<input name="chat_id" value="{}" maxlength="80"></label></div><div class="actions"><button>保存通知设置</button><label><input type="checkbox" name="clear_token" value="1">清除 Token</label></div></form><form method="post" action="/admin/test"><input type="hidden" name="csrf" value="{csrf}"><div class="actions"><button class="secondary">发送测试通知</button></div></form>"#,
+    let grace=grace_minutes(&conn);
+    let telegram=format!(r#"<form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid"><label>Bot Token<input type="password" name="bot_token" autocomplete="off" placeholder="{}"></label><label>Chat ID<input name="chat_id" value="{}" maxlength="80"></label><label>掉线宽限（分钟）<input type="number" name="offline_grace" min="0" max="60" value="{grace}"></label></div><div class="actions"><button>保存通知设置</button><label><input type="checkbox" name="clear_token" value="1">清除 Token</label></div></form><form method="post" action="/admin/test"><input type="hidden" name="csrf" value="{csrf}"><div class="actions"><button class="secondary">发送测试通知</button></div></form>"#,
         if bot {"已保存，留空则不修改"} else {"123456:ABC..."},esc(&chat));
     let here=request_hosts(&headers).into_iter().next().unwrap_or_default();
     // 常看的排前面，默认也只展开「节点」；设一次就不动的几张收在下面。
@@ -1038,7 +1039,7 @@ pub(super) async fn upload_icon(State(state):State<App>,headers:HeaderMap,body:a
     back("site")
 }
 
-#[derive(Deserialize)]pub(super) struct Settings {csrf:String,bot_token:String,chat_id:String,clear_token:Option<String>}
+#[derive(Deserialize)]pub(super) struct Settings {csrf:String,bot_token:String,chat_id:String,clear_token:Option<String>,offline_grace:Option<String>}
 pub(super) async fn save_settings(State(state):State<App>,headers:HeaderMap,Form(form):Form<Settings>)->Response {
     let Ok(mut conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     if !authorized(&headers,&conn,&form.csrf){return StatusCode::FORBIDDEN.into_response();}
@@ -1046,9 +1047,20 @@ pub(super) async fn save_settings(State(state):State<App>,headers:HeaderMap,Form
     if chat.len()>80||!chat.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'||b==b'_'||b==b'@')||token.len()>128||!token.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'||b==b'_'||b==b':') {
         return failure(StatusCode::BAD_REQUEST,"Telegram 设置格式有误");
     }
+    let grace=match form.offline_grace.as_deref().map(str::trim) {
+        None|Some("")=>None,
+        Some(value)=>match value.parse::<i64>() {
+            Ok(minutes) if (0..=MAX_GRACE_MINUTES).contains(&minutes)=>Some(minutes),
+            _=>return failure(StatusCode::BAD_REQUEST,"掉线宽限要在 0 到 60 分钟之间"),
+        },
+    };
     let Ok(tx)=conn.transaction() else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     if !token.is_empty()||form.clear_token.is_some(){let new=if form.clear_token.is_some(){""}else{token};if tx.execute("INSERT INTO admin_settings(key,value) VALUES('bot_token',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[new]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}}
-    if tx.execute("INSERT INTO admin_settings(key,value) VALUES('chat_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[chat]).is_err()||tx.commit().is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    if tx.execute("INSERT INTO admin_settings(key,value) VALUES('chat_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[chat]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    if let Some(minutes)=grace {
+        if tx.execute("INSERT INTO admin_settings(key,value) VALUES('offline_grace',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[minutes.to_string()]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    }
+    if tx.commit().is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     back("telegram")
 }
 pub(super) async fn test_telegram(State(state):State<App>,headers:HeaderMap,Form(form):Form<Csrf>)->Response {
@@ -1082,18 +1094,53 @@ pub(super) fn start_checks(path:Arc<str>){
         }
     });
 }
+/// 掉线宽限，默认 5 分钟（和 Komari 默认一样）。宽限内连回来的，离线、上线两条都不发。
+const DEFAULT_GRACE_MINUTES:i64=5;
+const MAX_GRACE_MINUTES:i64=60;
+fn grace_minutes(conn:&Connection)->i64 {
+    conn.query_row("SELECT value FROM admin_settings WHERE key='offline_grace'",[],|r|r.get::<_,String>(0)).ok()
+        .and_then(|v|v.parse::<i64>().ok()).map_or(DEFAULT_GRACE_MINUTES,|m|m.clamp(0,MAX_GRACE_MINUTES))
+}
+/// 通知用的"在线"：最后一次上报在宽限时间以内（至少 60 秒）。
+/// 只影响通知；后台和公开页上的在线状态照旧按 60 秒算。
+fn online_for_alerts(seen:Option<i64>,now:i64,grace_minutes:i64)->bool {
+    let window=(grace_minutes*60).max(60);
+    seen.is_some_and(|v|now-v<window)
+}
+/// 同一轮里一大半节点一起变（至少 3 台），多半是主控所在机器或它的网络出了事，合成一条，不刷屏。
+fn compose_alerts(went_off:&[String],came_on:&[String],total:usize)->Vec<String> {
+    let crowd=|n:usize|n>=3 && n*2>total;
+    let mut out=Vec::new();
+    if crowd(went_off.len()) {
+        out.push(format!("{} 台节点同时离线，可能是主控所在机器或它的网络出了问题：{}",went_off.len(),went_off.join("、")));
+    } else {
+        out.extend(went_off.iter().map(|name|format!("节点 {name} 已离线")));
+    }
+    if crowd(came_on.len()) {
+        out.push(format!("{} 台节点恢复上线：{}",came_on.len(),came_on.join("、")));
+    } else {
+        out.extend(came_on.iter().map(|name|format!("节点 {name} 已上线")));
+    }
+    out
+}
 async fn check_round(path:&str)->Result<(),Box<dyn Error>>{
-    let nodes:Vec<(String,String,Option<i64>,i64)>= {
+    let (nodes,grace):(Vec<(String,String,Option<i64>,i64)>,i64)= {
         let conn=db(path)?;
+        let grace=grace_minutes(&conn);
         let mut stmt=conn.prepare("SELECT n.id,n.name,n.last_seen,COALESCE(c.notify,1) FROM nodes n LEFT JOIN node_config c ON n.id=c.node_id")?;
         let rows=stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+        let nodes=rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        (nodes,grace)
     };
+    let total=nodes.len();
+    let (mut went_off,mut came_on)=(Vec::new(),Vec::new());
     for (id,name,seen,notify) in nodes {
-        let online=seen.is_some_and(|v|now()-v<60);
+        let online=online_for_alerts(seen,now(),grace);
         let Some(state)=transition(path,&format!("node:{id}"),online)? else {continue};
         if notify==0 {continue}
-        let msg=format!("节点 {name} {}",if state {"已上线"}else{"已离线"});
+        if state {came_on.push(name)} else {went_off.push(name)}
+    }
+    for msg in compose_alerts(&went_off,&came_on,total) {
         if let Err(e)=send_telegram(path,&msg).await {
             if !e.contains("请先保存") {eprintln!("Telegram notification failed: {e}");}
         }
@@ -1360,6 +1407,27 @@ mod tests {
         headers.insert("x-forwarded-host","evil.example.com".parse().unwrap());
         assert_eq!(hosts_from(&headers,true),vec!["test.example.com"],"走隧道：请求者自己写的 X-Forwarded-Host 不算");
         assert_eq!(hosts_from(&headers,false)[0],"evil.example.com","自己反代：反代写的 X-Forwarded-Host 优先");
+    }
+
+    #[test]
+    fn brief_drops_stay_quiet() {
+        let now=1_000_000;
+        assert!(online_for_alerts(Some(now-240),now,5),"断了 4 分钟，还在 5 分钟宽限里");
+        assert!(!online_for_alerts(Some(now-301),now,5),"超过 5 分钟才算离线");
+        assert!(online_for_alerts(Some(now-59),now,0),"宽限设成 0 时照旧按 60 秒");
+        assert!(!online_for_alerts(Some(now-61),now,0));
+        assert!(!online_for_alerts(None,now,5),"从没上报过的算离线");
+    }
+
+    #[test]
+    fn crowd_changes_are_merged() {
+        let names=|n:usize|(0..n).map(|i|format!("n{i}")).collect::<Vec<_>>();
+        assert_eq!(compose_alerts(&names(2),&[],11).len(),2,"少数几台照常一台一条");
+        let merged=compose_alerts(&names(8),&[],11);
+        assert_eq!(merged.len(),1,"一大半同时离线合成一条");
+        assert!(merged[0].starts_with("8 台节点同时离线"));
+        assert_eq!(compose_alerts(&[],&names(9),11).len(),1,"一起恢复也合成一条");
+        assert_eq!(compose_alerts(&names(2),&[],3).len(),2,"至少 3 台才合并");
     }
 
     #[test]
