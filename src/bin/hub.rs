@@ -53,7 +53,6 @@ struct Metrics {
     #[serde(default)] arch: String,
     #[serde(default)] cpu_model: String,
     #[serde(default)] cpu_cores: u32,
-    #[serde(default)] latency_ms: Option<f64>,
     #[serde(default)] version: String,
     /// /proc/sys/kernel/random/boot_id。每次开机都会变，用来判断流量计数器是不是同一次开机的。
     #[serde(default)] boot: String,
@@ -197,7 +196,6 @@ fn valid(m: &Metrics) -> bool {
     [m.cpu, m.memory, m.disk, m.rx, m.tx, m.load, m.load5, m.load15].iter().all(|v| v.is_finite() && *v >= 0.0)
         && m.cpu <= 100.0 && m.memory <= 100.0 && m.disk <= 100.0
         && m.uptime <= i64::MAX as u64
-        && m.latency_ms.map_or(true,|v| v.is_finite() && (0.0..=10000.0).contains(&v))
         && [m.mem_used,m.mem_total,m.swap_used,m.swap_total,m.disk_used,m.disk_total,m.rx_bytes,m.tx_bytes]
             .iter().all(|v| *v <= i64::MAX as u64)
         && m.os.len() <= 160 && m.kernel.len() <= 160 && m.arch.len() <= 80
@@ -541,8 +539,9 @@ fn store_metrics(tx: &Connection, id: &str, at: i64, m: &Metrics, last_sample: &
     if at - *last_sample >= 60 {
         tx.execute("INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?)",
             params![id,at,m.cpu,m.memory,m.disk,m.rx,m.tx,m.load,m.uptime as i64])?;
-        // 被控还会报一个到主控的握手延迟（latency_ms），不再存也不再画：主控在 Cloudflare 后面，
-        // 握手对象其实是离节点最近的 Cloudflare 机房，数值没有意义。Komari、极简探针都没有这个指标。
+        // 以前被控还会报一个到主控的握手延迟（latency_ms），已经删了：主控在 Cloudflare 后面，
+        // 握手对象其实是离节点最近的 Cloudflare 机房，数值没有意义。没重装的老被控还会带着它，
+        // 这里的结构体不拒绝多余字段，直接忽略。
         *last_sample = at;
     }
     if m.mem_total > 0 {

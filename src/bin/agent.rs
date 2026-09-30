@@ -55,7 +55,6 @@ struct Metrics {
     arch: String,
     cpu_model: String,
     cpu_cores: u32,
-    latency_ms: Option<f64>,
     /// 排查「hub 升了 agent 没升」时唯一能指望的东西。
     version: &'static str,
     /// 本次开机的 ID。hub 靠它区分「计数器涨了」和「机器重启过、计数器从零开始」，
@@ -205,7 +204,7 @@ fn read_metrics(previous: &mut Option<Counters>, system: &SystemInfo) -> io::Res
         disk: percent(disk_used,disk_total), rx: rx_rate, tx: tx_rate, load, uptime,
         mem_used,mem_total,swap_used,swap_total,disk_used,disk_total,rx_bytes:rx,tx_bytes:tx,
         load5,load15,os:system.os.clone(),kernel:system.kernel.clone(),arch:system.arch.clone(),
-        cpu_model:system.cpu_model.clone(),cpu_cores:system.cpu_cores,latency_ms:None,
+        cpu_model:system.cpu_model.clone(),cpu_cores:system.cpu_cores,
         version:env!("CARGO_PKG_VERSION"),boot:system.boot.clone() })
 }
 
@@ -314,15 +313,6 @@ fn dial(address: SocketAddr, request: tungstenite::handshake::client::Request) -
     stream.set_write_timeout(Some(Duration::from_secs(15)))?;
     let (socket, _) = tungstenite::client_tls(request, stream).map_err(|error| error.to_string())?;
     Ok(socket)
-}
-
-fn hub_tcp_latency(url: &url::Url) -> Option<f64> {
-    let host = url.host_str()?;
-    let port = url.port_or_known_default()?;
-    let address = (host, port).to_socket_addrs().ok()?.next()?;
-    let started = Instant::now();
-    TcpStream::connect_timeout(&address, Duration::from_millis(750)).ok()?;
-    Some(started.elapsed().as_secs_f64() * 1000.0)
 }
 
 enum Outcome {
@@ -472,8 +462,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let system = system_info();
     let mut schedule = Schedule::default();
     let mut previous = None;
-    let mut latency = None;
-    let mut next_latency = Instant::now();
 
     loop {
         match open_hub(&url, &token) {
@@ -538,12 +526,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if Instant::now() >= next_metrics {
                         next_metrics = Instant::now() + Duration::from_secs(interval);
                         match read_metrics(&mut previous, &system) {
-                            Ok(mut metrics) => {
-                                if Instant::now() >= next_latency {
-                                    latency = hub_tcp_latency(&url);
-                                    next_latency = Instant::now() + Duration::from_secs(60);
-                                }
-                                metrics.latency_ms = latency;
+                            Ok(metrics) => {
                                 let Ok(payload) = serde_json::to_string(&Up::Metrics(&metrics)) else { break };
                                 if let Err(error) = socket.send(Message::Text(payload.into())) {
                                     eprintln!("连接已断开: {error}");
