@@ -281,7 +281,7 @@ fn card(id:&str,title:&str,open:bool,body:&str)->String {
     format!("<details class=\"card\" id=\"{id}\"{}><summary>{title}</summary>{body}</details>",if open {" open"} else {""})
 }
 /// 卡片里的一小块，也能收起展开，标题是浅色的小字（和「流量校正」一样）。
-fn part(id:&str,title:&str,open:bool,body:&str)->String {
+fn fold(id:&str,title:&str,open:bool,body:&str)->String {
     format!("<details id=\"{id}\"{}><summary class=\"muted\">{title}</summary>{body}</details>",if open {" open"} else {""})
 }
 /// 列表最后那一行「新增」，排法和上面的每一行一样，只是没有上下箭头。
@@ -712,12 +712,12 @@ pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):
     let monitors=format!("{}{}",monitors_section(&conn,&csrf,&open),new_row("m-new",&open,&monitor_form(&conn,&csrf,None,"","",60,false,&HashSet::new())));
     let rules_open=open=="rules"||open.starts_with("r-");
     let page=format!("<h1>控制台</h1>{}{}{}{}{}{}{}{}{}<form method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"secondary\">退出登录</button></form>",
-        card("nodes","节点管理",node_list||open=="add-node",&format!("{}{}",part("add-node","新增节点",open=="add-node",&add_node),part("node-list","节点",node_list,&body))),
+        card("nodes","节点管理",node_list||open=="add-node",&format!("{}{}",fold("add-node","新增节点",open=="add-node",&add_node),fold("node-list","节点",node_list,&body))),
         card("monitors","TCP 监控",open=="monitors"||open.starts_with("m-"),&monitors),
         card("site","站点",open=="site",&site_section(&conn,&csrf)),
         card("palette","配色",open=="palette",&palette_section(&csrf)),
         card("access","访问控制",open=="access",&access_section(&csrf,&here)),
-        card("notify","通知",open=="telegram"||rules_open,&format!("{}{}",part("telegram","Telegram",open=="telegram",&telegram),part("rules","资源监控",rules_open,&rules_section(&conn,&csrf,&open)))),
+        card("notify","通知",open=="telegram"||rules_open,&format!("{}{}",fold("telegram","Telegram",open=="telegram",&telegram),fold("rules","资源监控",rules_open,&rules_section(&conn,&csrf,&open)))),
         card("account","账号",open=="account",&account_section(&conn,&csrf,manage)),
         card("sessions","登录设备",open=="sessions",&sessions_section(&conn,&csrf,&current,manage)),
         card("backup","备份",open=="backup",&backup_section(&csrf)));
