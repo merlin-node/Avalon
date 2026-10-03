@@ -5,12 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <link rel="icon" href="/favicon.png" />
     <link rel="manifest" href="/manifest.json" />
-    <!-- LXGW WenKai Screen R, split into subsets by unicode-range and served from
-         the CDN. The preload is the subset holding the Latin and punctuation the
-         page shows before the CJK ones arrive. -->
-    <link rel="preconnect" href="https://gw.alipayobjects.com" crossorigin />
-    <link rel="preload" as="font" type="font/woff2" crossorigin href="https://gw.alipayobjects.com/os/k/font/files/lxgwwenkaiscreenr-subset-119.woff2" />
-    <link rel="stylesheet" href="/lxgwwenkai.css" />
     <title>Monitor</title>
     <!-- A phone paints its own bars over or beside the document, where no stylesheet
          reaches. These together make the header run into the status bar instead of
@@ -18,7 +12,9 @@
          the two capable metas open this as an app rather than a tab, and theme-color
          is what Chrome tints its bars with. All of them carry the header's --nav, so
          bar and header read as one surface; App.tsx keeps the colour in step with the
-         theme, and index.css sets color-scheme so the bar's glyphs flip with it. -->
+         theme, and index.css sets color-scheme so the bar's glyphs flip with it.
+         The hub writes the chosen palette's two --nav values onto <html> as
+         data-nav-dark and data-nav-light; the fallbacks are the original palette's. -->
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -26,11 +22,15 @@
     <script>
       // In head, so the dark page is dark on the first paint. Same rule as useTheme:
       // only a stored preference moves either of these.
-      if (localStorage.getItem("theme") === "light") {
-        document.querySelector('meta[name="theme-color"]').content = "#f9f9f9"
-      } else {
-        document.documentElement.classList.add("dark")
-      }
+      ;(function () {
+        var html = document.documentElement, bar = document.querySelector('meta[name="theme-color"]')
+        if (localStorage.getItem("theme") === "light") {
+          bar.content = html.dataset.navLight || "#f9f9f9"
+        } else {
+          html.classList.add("dark")
+          bar.content = html.dataset.navDark || "#1c2127"
+        }
+      })()
     </script>
   </head>
   <body>

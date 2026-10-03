@@ -28,6 +28,7 @@ const NODES_CACHE: Duration = Duration::from_secs(1);
 mod access;
 mod admin;
 mod expiry;
+mod palette;
 mod ping;
 mod site;
 
@@ -134,6 +135,7 @@ fn init_db(path: &str) -> rusqlite::Result<()> {
     }
     ping::init(&conn)?;
     site::init(&conn)?;
+    palette::init(&conn)?;
     access::init(&conn)?;
     migrate(&conn)?;
     Ok(())
@@ -766,6 +768,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .route("/admin/monitors/{id}/move",post(admin::move_monitor))
                 .route("/admin/settings",post(admin::save_settings))
                 .route("/admin/site",post(admin::save_site))
+                .route("/admin/palette",post(admin::save_palette))
                 .route("/admin/site/icon",post(admin::upload_icon))
                 .route("/admin/test",post(admin::test_telegram))
                 .route("/api/nodes",get(nodes)).route("/api/nodes/{id}/history",get(history))

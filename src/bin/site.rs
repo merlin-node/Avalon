@@ -256,14 +256,24 @@ pub(super) async fn info(State(state): State<App>, headers: HeaderMap) -> impl I
     ([(CACHE_CONTROL, "no-store")], Json(serde_json::json!({ "site_name": name(), "admin_url": admin_url })))
 }
 
-/// 首页。把主题里写死的 <title>Monitor</title> 换成站点名，JS 还没跑起来时标签页就是对的。
-/// 页面本身不缓存：它引用的 JS 文件名带指纹，页面一换，浏览器就会去取新的那份。
+/// 主题构建出来的首页。改写要用到的三处在测试里核对，构建产物变了样会在 CI 上报出来。
+const INDEX: &str = include_str!("../../theme/dist/index.html");
+
+/// 首页。把主题里写死的 <title>Monitor</title> 换成站点名，JS 还没跑起来时标签页就是对的；
+/// 再写进后台选的配色：颜色在 </head> 前的一段 <style> 里，手机状态栏的颜色放在 html 的
+/// data-nav-dark / data-nav-light 上，index.html 头部那段脚本和 App.tsx 从那儿读。
+/// 页面本身不缓存：它引用的 JS 文件名带指纹，页面一换，浏览器就会去取新的那份；换了配色刷新即见。
 pub(super) async fn home() -> impl IntoResponse {
-    let page = include_str!("../../theme/dist/index.html").replacen(
-        "<title>Monitor</title>",
-        &format!("<title>{}</title>", escape(&name())),
-        1,
-    );
+    let chosen = palette::current();
+    let (nav_dark, nav_light) = palette::nav(chosen);
+    let page = INDEX
+        .replacen("<title>Monitor</title>", &format!("<title>{}</title>", escape(&name())), 1)
+        .replacen(
+            "<html lang=\"zh-CN\">",
+            &format!("<html lang=\"zh-CN\" data-nav-dark=\"{nav_dark}\" data-nav-light=\"{nav_light}\">"),
+            1,
+        )
+        .replacen("</head>", &format!("{}</head>", palette::public_style(chosen)), 1);
     ([(CACHE_CONTROL, "no-cache")], Html(page))
 }
 
@@ -272,7 +282,7 @@ pub(super) async fn manifest() -> impl IntoResponse {
     let name = name();
     let body = serde_json::json!({
         "name": name, "short_name": name, "start_url": "/", "scope": "/",
-        "display": "standalone", "background_color": "#31363b",
+        "display": "standalone", "background_color": palette::background(palette::current()),
         "icons": [{ "src": "/favicon.png", "sizes": "any" }]
     });
     ([(CONTENT_TYPE, "application/manifest+json")], body.to_string())
@@ -368,6 +378,15 @@ mod tests {
         assert!(choose(&conn, "tools").unwrap());
         delete(&conn, "emoji").unwrap();
         assert_eq!(current_choice(&conn), "tools", "删掉没在用的，不影响当前图标");
+    }
+
+    #[test]
+    fn home_page_has_what_we_rewrite() {
+        assert_eq!(INDEX.matches("<title>Monitor</title>").count(), 1);
+        assert_eq!(INDEX.matches("<html lang=\"zh-CN\">").count(), 1, "配色的状态栏颜色写在这里");
+        assert_eq!(INDEX.matches("</head>").count(), 1, "配色的 <style> 插在这前面");
+        assert!(INDEX.contains("navDark") && INDEX.contains("navLight"), "头部脚本要从 data-nav-* 读状态栏颜色");
+        assert!(!INDEX.contains("lxgwwenkai"), "字体已换成系统字体");
     }
 
     #[test]

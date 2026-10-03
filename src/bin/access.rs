@@ -224,7 +224,7 @@ fn harden(response: &mut Response, admin: bool) {
         // 后台一行脚本都没有，干脆禁止执行任何脚本：哪天有东西被注入进页面，浏览器也不会跑它。
         // 只允许本站的图片、页面里的内联样式、提交给本站的表单。
         headers.insert("content-security-policy", HeaderValue::from_static(
-            "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'sha256-uQiaYvkvkLgz7iRFBYohrNVL5sUXk9BBAPCHM4bTfkQ='; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"));
+            "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'sha256-NmlvtkuSs3zwCEhwjfvUE01hzf1HKyJ3/G42pMPwMhs='; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"));
     }
 }
 

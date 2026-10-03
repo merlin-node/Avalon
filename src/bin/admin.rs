@@ -220,7 +220,9 @@ const ADMIN_CSS:&str=r#"
 :root[data-theme="dark"]{--bg:#31363b;--text:#f1f1f1;--head:#1c2127;--line:#3a3e41;--line-soft:#30343a;--card:#1c1d26;--field:#22232e;--field-line:#4a4f55;--label:#aaaaaa;--link:#4992ff;--btn:#2d6cc8;--btn2:#303241;--btn2-text:#f1f1f1;--danger:#e0605c;--danger-line:#6b3b3b;--muted:#a3a3a3;--ok:#5fb865;--down:#e0605c;--code:#22232e;color-scheme:dark}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,sans-serif}
 header{background:var(--head);border-bottom:1px solid var(--line);padding:14px max(16px,calc((100vw - 1050px)/2));display:flex;align-items:center;gap:24px}a{color:var(--link)}header a{text-decoration:none}main{max-width:1050px;margin:28px auto;padding:0 16px 60px}h1{font-size:21px;margin:0 0 15px}h2{font-size:16px;margin:0 0 12px}.card{background:var(--card);border:1px solid var(--line);padding:20px;margin:12px 0}.card>summary{font-size:16px;font-weight:700;margin:0}.card[open]>summary{margin:0 0 12px}.row{display:flex;gap:8px;align-items:flex-start}.row>details{flex:1;min-width:0}.move{display:flex;gap:4px;margin:0;flex:none}.move button{padding:2px 10px;min-width:34px}.ghost{visibility:hidden}.grow{flex:1;min-width:0}button:disabled{opacity:.45;cursor:not-allowed}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px}label{display:block;color:var(--label);font-size:13px}input,select{display:block;width:100%;border:1px solid var(--field-line);border-radius:0;padding:9px 10px;background:var(--field);color:var(--text);font:inherit;margin-top:5px}input[type=checkbox]{width:auto;display:inline-block;margin-right:5px}input[type=radio]{width:auto;display:inline-block;margin:0 5px 0 0;vertical-align:-1px}.icons{display:flex;flex-wrap:wrap;gap:10px;margin-top:6px}.icon-choice{display:flex;flex-direction:column;align-items:center;gap:6px;border:1px solid var(--line);background:var(--card);padding:10px 12px;cursor:pointer;min-width:96px;color:var(--text)}.icon-choice img{object-fit:contain}.upload{margin-top:22px;padding-top:16px;border-top:1px dashed var(--line-soft)}button.link{background:none;color:var(--danger);padding:0;font-size:13px}.icon-choice:has(input:checked){border-color:var(--btn);box-shadow:0 0 0 1px var(--btn)}button{background:var(--btn);color:#fff;border:0;border-radius:0;padding:10px 16px;cursor:pointer;font:inherit}button.secondary{background:var(--btn2);color:var(--btn2-text)}button.danger{background:var(--card);color:var(--danger);border:1px solid var(--danger-line)}form{margin:0}.actions{display:flex;gap:10px;align-items:center;margin-top:15px;flex-wrap:wrap}small,.muted{color:var(--muted)}.node{border-top:1px solid var(--line-soft);padding:15px 0}.node:first-child{border-top:0}details>summary{cursor:pointer;font-weight:650;font-size:15px}code{overflow-wrap:anywhere}.ok{color:var(--ok)}.down{color:var(--down)}.picker{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px 12px;max-height:230px;overflow:auto;border:1px solid var(--line-soft);padding:10px;margin-top:6px}.picker label{color:var(--text)}.brand{display:flex;align-items:center;gap:8px}.brand img{object-fit:contain}.cmd{display:block;white-space:pre-wrap;word-break:break-all;background:var(--code);border:1px solid var(--line);padding:12px;margin:10px 0;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--text);-webkit-user-select:all;user-select:all}
-.look{margin-left:auto;display:flex}.look button{background:none;color:var(--text);padding:4px;border:0;display:grid;place-items:center}.look .to-light{display:none}
+.look{margin-left:auto;display:flex}.look button{background:none;color:var(--link);padding:4px;border:0;display:grid;place-items:center}.look .to-light{display:none}
+@keyframes look-pop{from{transform:rotate(-100deg) scale(.4);opacity:0}to{transform:none;opacity:1}}:root[data-flip] .look svg{animation:look-pop .45s cubic-bezier(.3,1.4,.5,1)}@media (prefers-reduced-motion:reduce){:root[data-flip] .look svg{animation:none}}
+.swatch{display:flex;width:72px;height:14px;border-radius:7px;overflow:hidden;box-shadow:0 0 0 1px var(--line)}.swatch i{flex:1}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .look .to-light{display:grid}:root:not([data-theme="light"]) .look .to-dark{display:none}}
 :root[data-theme="dark"] .look .to-light{display:grid}:root[data-theme="dark"] .look .to-dark{display:none}
 @media(max-width:600px){main{margin:12px auto}.card{padding:14px}}
@@ -229,12 +231,13 @@ header{background:var(--head);border-bottom:1px solid var(--line);padding:14px m
 const LOOK_BUTTONS:&str=r#"<button class="to-dark" name="to" value="dark" aria-label="切换到黑夜" title="黑夜"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button><button class="to-light" name="to" value="light" aria-label="切换到白天" title="白天"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>"#;
 
 /// 点亮暗按钮时在浏览器里直接换颜色，再在后台把选择告诉服务器记住，不用整页重载。
+/// 顺手在 html 上标一个 data-flip：有它，换出来的图标才转着弹出来；刚打开页面时没有，不会每次都转。
 /// 后台禁止一切脚本，只有这一段靠内容指纹放行（access.rs 的 CSP）：改一个字指纹就不对，
 /// 浏览器会拒绝执行，按钮自动退回原来的"提交表单、服务器重发页面"。改了这段必须同步改指纹。
-pub(super) const LOOK_SCRIPT:&str=r#"document.querySelector("form.look").addEventListener("submit",function(e){var b=e.submitter;if(!b)return;e.preventDefault();document.documentElement.setAttribute("data-theme",b.value);fetch(this.action,{method:"POST",body:new URLSearchParams({to:b.value}),redirect:"manual",credentials:"same-origin"})})"#;
+pub(super) const LOOK_SCRIPT:&str=r#"document.querySelector("form.look").addEventListener("submit",function(e){var b=e.submitter;if(!b)return;e.preventDefault();var h=document.documentElement;h.setAttribute("data-theme",b.value);h.setAttribute("data-flip","");fetch(this.action,{method:"POST",body:new URLSearchParams({to:b.value}),redirect:"manual",credentials:"same-origin"})})"#;
 /// LOOK_SCRIPT 的 SHA-256，测试里核对，防止改了脚本忘了改指纹。
 #[cfg(test)]
-const LOOK_SCRIPT_SHA256:&str="b9089a62f92f90b833ee2445058a21acd54be6c51793d04100f0873386d37e44";
+const LOOK_SCRIPT_SHA256:&str="36696fb64b92b37cf00848708dfbd4134d61cdfd472b2277fc6e36a4c3f0321b";
 
 fn frame(body:&str)->Html<String> {
     let site=site::escape(&site::name());
@@ -245,7 +248,9 @@ fn frame(body:&str)->Html<String> {
     let look=match LOOK.try_with(|look|*look).unwrap_or(Look::Auto) {
         Look::Light=>" data-theme=\"light\"", Look::Dark=>" data-theme=\"dark\"", Look::Auto=>"",
     };
-    Html(format!(r#"<!doctype html><html lang="zh-CN"{look}><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{site} · 管理</title><style>{ADMIN_CSS}</style><header><strong class="brand"><img src="{base}/icon" alt="" width="20" height="20">{site}</strong><a href="/">首页</a><span class="muted">管理</span><form class="look" method="post" action="{base}/theme">{LOOK_BUTTONS}</form><script>{LOOK_SCRIPT}</script></header><main>{body}</main></html>"#))
+    // 后台选的配色接在 ADMIN_CSS 后面覆盖它；原版是空串，页面和以前一模一样。
+    let tint=palette::admin_css(palette::current());
+    Html(format!(r#"<!doctype html><html lang="zh-CN"{look}><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{site} · 管理</title><style>{ADMIN_CSS}{tint}</style><header><strong class="brand"><img src="{base}/icon" alt="" width="20" height="20">{site}</strong><a href="/">首页</a><span class="muted">管理</span><form class="look" method="post" action="{base}/theme">{LOOK_BUTTONS}</form><script>{LOOK_SCRIPT}</script></header><main>{body}</main></html>"#))
 }
 
 /// 切换亮暗。只是个显示偏好，不用登录，但要求同源；切完回到刚才那一页。
@@ -420,6 +425,17 @@ fn site_section(conn:&Connection,csrf:&str)->String {
 <label>上传图片<input type="file" name="icon" accept="image/png,image/jpeg,image/gif,image/webp,image/x-icon" required></label>
 <div class="actions"><button class="secondary">上传</button></div></form></div>"#,
         esc(&site::name()))
+}
+
+/// 配色。单选一套，保存后公开页、主域名、登录页和后台一起换；访客那边没有选配色的地方。
+fn palette_section(csrf:&str)->String {
+    let current=palette::current().key;
+    let mut choices=String::new();
+    for p in palette::PALETTES.iter() {
+        let checked=if p.key==current {" checked"} else {""};
+        choices.push_str(&format!(r#"<label class="icon-choice"><span class="swatch">{}</span><span><input type="radio" name="palette" value="{}"{checked}>{}</span></label>"#,palette::swatch(p),p.key,p.name));
+    }
+    format!(r#"<form method="post" action="/admin/palette"><input type="hidden" name="csrf" value="{csrf}"><div class="icons">{choices}</div><div class="actions"><button>使用</button></div></form>"#)
 }
 
 /// 访问控制：后台地址、展示页域名、公开页开关。
@@ -624,12 +640,13 @@ pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):
         if bot {"已保存，留空则不修改"} else {"123456:ABC..."},esc(&chat));
     let here=request_hosts(&headers).into_iter().next().unwrap_or_default();
     // 常看的排前面，默认也只展开「节点」；设一次就不动的几张收在下面。
-    let page=format!("<h1>控制台</h1>{}{}{}{}{}{}{}{}{}{}<form method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"secondary\">退出登录</button></form>",
+    let page=format!("<h1>控制台</h1>{}{}{}{}{}{}{}{}{}{}{}<form method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"secondary\">退出登录</button></form>",
         card("add-node","添加节点",open=="add-node",&add_node),
         card("nodes","节点",open.is_empty()||open=="nodes"||open.starts_with("n-"),&body),
         card("add-monitor","添加监控",open=="add-monitor",&monitor_form(&conn,&csrf,None,"","",60,false,&HashSet::new())),
         card("monitors","延迟监控",open=="monitors"||open.starts_with("m-"),&monitors_section(&conn,&csrf,&open)),
         card("site","站点",open=="site",&site_section(&conn,&csrf)),
+        card("palette","配色",open=="palette",&palette_section(&csrf)),
         card("access","访问控制",open=="access",&access_section(&csrf,&here)),
         card("telegram","Telegram 通知",open=="telegram",&telegram),
         card("account","账号",open=="account",&account_section(&conn,&csrf,manage)),
@@ -1023,6 +1040,17 @@ pub(super) async fn save_site(State(state):State<App>,headers:HeaderMap,body:Str
         if site::save_emoji(&conn,&emoji).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     }
     back("site")
+}
+
+#[derive(Deserialize)] pub(super) struct PaletteChoice {csrf:String,palette:String}
+pub(super) async fn save_palette(State(state):State<App>,headers:HeaderMap,Form(form):Form<PaletteChoice>)->Response {
+    let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,&form.csrf){return StatusCode::FORBIDDEN.into_response();}
+    match palette::save(&conn,&form.palette) {
+        Ok(true)=>back("palette"),
+        Ok(false)=>failure(StatusCode::BAD_REQUEST,"没有这套配色"),
+        Err(_)=>StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 pub(super) async fn upload_icon(State(state):State<App>,headers:HeaderMap,body:axum::body::Bytes)->Response {

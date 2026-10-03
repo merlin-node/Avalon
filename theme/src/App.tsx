@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useState, type ReactNode } from "react"
-import { ArrowUp, ChartLine, House, Moon, Sun, UserRound, type LucideIcon } from "lucide-react"
+import { ArrowUp, ChartLine, House, UserRound, type LucideIcon } from "lucide-react"
 
 import { NodePicker } from "@/components/NodePicker"
 import { ServerTable } from "@/components/ServerTable"
@@ -24,10 +24,41 @@ function useTheme() {
     localStorage.setItem("theme", dark ? "dark" : "light")
     // The bars a phone draws around the page are the browser's, not the page's, so
     // the stylesheet cannot reach them; they take --nav, the header's own colour.
+    // The hub puts the chosen palette's two values on <html>; these fallbacks are the original's.
     const meta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')
-    if (meta) meta.content = dark ? "#1c2127" : "#f9f9f9"
+    const root = document.documentElement
+    if (meta) meta.content = dark ? root.dataset.navDark || "#1c2127" : root.dataset.navLight || "#f9f9f9"
   }, [dark])
   return [dark, () => setDark((d) => !d)] as const
+}
+
+/**
+ * The admin panel's own sun and moon (LOOK_BUTTONS in admin.rs), so both pages show
+ * the same pair. Remounted on every switch through its key, which replays the spin.
+ */
+function LookIcon({ dark, spin }: { dark: boolean; spin: boolean }) {
+  return (
+    <svg
+      key={dark ? "sun" : "moon"}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+      className={spin ? "size-3.5 look-pop" : "size-3.5"}
+    >
+      {dark ? (
+        <>
+          <circle cx="12" cy="12" r="4" />
+          <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+        </>
+      ) : (
+        <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+      )}
+    </svg>
+  )
 }
 
 /** Kept in the corner rather than the header, as the classic layout does. */
@@ -67,6 +98,8 @@ function NavItem({ href, active, icon: Icon, children }: { href: string; active:
 
 export default function App() {
   const [dark, toggleTheme] = useTheme()
+  // Only a click spins the icon; the first paint shows it still.
+  const [spun, setSpun] = useState(false)
   const [me, setMe] = useState<Me | null>(null)
   const [meError, setMeError] = useState("")
   const { nodes, error, closed } = useNodes()
@@ -129,17 +162,17 @@ export default function App() {
             )}
           </nav>
           <button
-            onClick={toggleTheme}
+            onClick={() => { toggleTheme(); setSpun(true) }}
             title="切换主题"
             aria-label="切换主题"
-            className="ml-auto inline-flex shrink-0 items-center px-3.5 text-sm transition-colors hover:text-primary max-sm:px-2.5"
+            className="ml-auto inline-flex shrink-0 items-center px-3.5 text-sm text-primary transition-colors max-sm:px-2.5"
           >
-            {dark ? <Sun className="size-3.5" /> : <Moon className="size-3.5" />}
+            <LookIcon dark={dark} spin={spun} />
           </button>
           {/* 后台入口只给已登录的管理员，指向 hub 告诉我们的（可能是隐藏的）地址；
               访客的页面上不出现任何后台痕迹。 */}
           {me.admin_url && (
-            <a href={me.admin_url} className="inline-flex shrink-0 items-center gap-1.5 px-3.5 text-sm transition-colors hover:text-primary max-sm:px-2">
+            <a href={me.admin_url} className="inline-flex shrink-0 items-center gap-1.5 px-3.5 text-sm text-primary transition-colors max-sm:px-2">
               <UserRound className="size-3.5" />
               <span className="max-sm:sr-only">后台</span>
             </a>

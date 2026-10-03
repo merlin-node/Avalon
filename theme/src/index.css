@@ -8,7 +8,10 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* The classic ServerStatus palette: Bootstrap 3's greys, its green, amber and red
+/* The original palette. The others are chosen in the admin panel and arrive as a
+   <style> the hub puts in the page (src/bin/palette.rs), which overrides these.
+
+   The classic ServerStatus palette: Bootstrap 3's greys, its green, amber and red
    as top-to-bottom gradients on bars and status dots, and a navy-grey dark mode.
    The chart hues are separate and muted, so five probes stay distinguishable
    without competing with the bars. */
@@ -134,14 +137,23 @@
      on, which the `dark` variant cannot match. */
   html { scrollbar-gutter: stable; color-scheme: light; }
   html.dark { color-scheme: dark; }
-  /* The classic theme's webfont, from the subsets public/lxgwwenkai.css names;
-     the system stack behind it covers whatever they leave out. */
+  /* The system's own face: San Francisco and PingFang on Apple devices. Nothing is
+     fetched from another site. */
   body {
     @apply bg-background text-foreground;
-    font-family: "LXGW WenKai Screen R", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
       "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   }
 }
 
 /* Tabular figures keep live numbers from shifting as they update. */
 .tnum { font-variant-numeric: tabular-nums; }
+
+/* The light/dark icon spins in when it is clicked, not when the page opens: App.tsx
+   adds the class only after the first toggle. The admin panel's ADMIN_CSS has the same. */
+@keyframes look-pop {
+  from { transform: rotate(-100deg) scale(0.4); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+.look-pop { animation: look-pop 0.45s cubic-bezier(0.3, 1.4, 0.5, 1); }
+@media (prefers-reduced-motion: reduce) { .look-pop { animation: none; } }
