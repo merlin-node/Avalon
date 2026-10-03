@@ -678,6 +678,21 @@ fn apply_pending_restore(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 库里有管理员密码哈希、所有节点 token 和 Bot Token，只该 hub 自己能读。
+/// umask 让这个进程以后建的文件（数据库、-wal、-shm、上传恢复的暂存、备份）一律是 600；
+/// 老版本建的是 644，启动时和换上恢复的库之后再各改一遍。
+fn lock_down(path: &str) {
+    // SAFETY: umask 只改本进程新建文件的默认权限，不涉及任何内存。
+    unsafe { libc::umask(0o077); }
+    restrict(path);
+}
+fn restrict(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["", "-wal", "-shm", ".before-restore", ".before-restore-wal"] {
+        let _ = std::fs::set_permissions(format!("{path}{suffix}"), std::fs::Permissions::from_mode(0o600));
+    }
+}
+
 fn option(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone())
 }
@@ -694,6 +709,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
     // 数据库路径：--db 优先，其次环境变量 AVALON_DB（Docker 镜像里设成 /data/probe.db），最后是当前目录。
     let path = option(&args,"--db").or_else(|| std::env::var("AVALON_DB").ok()).unwrap_or_else(|| "probe.db".to_string());
+    lock_down(&path);
     match args.get(1).map(String::as_str) {
         Some("add-node") => {
             let name = args.get(2).filter(|v| !v.starts_with("--")).ok_or("用法: probe-hub add-node 名称 [--private] [--db 路径]")?;
@@ -740,6 +756,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Some("serve") => {
             apply_pending_restore(&path)?;
+            restrict(&path);
             init_db(&path)?;
             admin::start_checks(Arc::from(path.clone()));
             start_cleanup(Arc::from(path.clone()));
@@ -791,6 +808,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn database_files_become_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("avalon-perm-{}.db", std::process::id()));
+        let path = path.to_str().unwrap().to_string();
+        for suffix in ["", "-wal"] {
+            std::fs::write(format!("{path}{suffix}"), b"x").unwrap();
+            std::fs::set_permissions(format!("{path}{suffix}"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        restrict(&path);
+        for suffix in ["", "-wal"] {
+            let mode = std::fs::metadata(format!("{path}{suffix}")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "老版本建的 644 要改成 600");
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
     #[test]
     fn filters_invalid_metrics() {
         let m: Metrics = serde_json::from_str(r#"{"cpu":101,"memory":10,"disk":20,"rx":0,"tx":0,"load":0,"uptime":1}"#).unwrap();

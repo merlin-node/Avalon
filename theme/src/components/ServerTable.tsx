@@ -15,16 +15,18 @@ import { Link } from "@/lib/route"
 import { cn } from "@/lib/utils"
 
 // Emitted as files and fetched on first use, so a page carries only the flags its
-// nodes are in rather than all 271. vite.config.ts keeps the small ones from being
-// inlined into the bundle as data URLs.
+// nodes are in rather than the whole set. vite.config.ts keeps them from being
+// inlined into the bundle as data URLs. country-flag-icons rather than flag-icons:
+// the same countries in about a tenth of the bytes the hub embeds. Its files are
+// named in capitals (US.svg), the codes here are looked up in lower case.
 const FLAGS = Object.fromEntries(
   Object.entries(
-    import.meta.glob<string>("/node_modules/flag-icons/flags/4x3/*.svg", {
+    import.meta.glob<string>("/node_modules/country-flag-icons/3x2/*.svg", {
       query: "?url",
       import: "default",
       eager: true,
     }),
-  ).map(([path, url]) => [path.match(/([\w-]+)\.svg$/)![1], url]),
+  ).map(([path, url]) => [path.match(/([\w-]+)\.svg$/)![1].toLowerCase(), url]),
 )
 
 const Latency = lazy(() => import("@/components/NodeDetail").then((m) => ({ default: m.Latency })))
