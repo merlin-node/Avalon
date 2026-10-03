@@ -211,11 +211,17 @@ fn harden(response: &mut Response, admin: bool) {
     let headers = response.headers_mut();
     headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
     headers.insert("referrer-policy", HeaderValue::from_static("same-origin"));
-    // 空 404 没有内容类型，又带着上面的 nosniff，Safari 会把它当成文件弹出下载。
-    // 统一标成纯文本，浏览器显示一片空白。
+    // 没标内容类型的响应一律变成空白网页：正文清空，再标成网页。
+    // 空 404 不标类型、又带着上面的 nosniff，Safari 会当成文件弹出下载；标成纯文本，iOS 上的 Chrome
+    // 照样弹（document.txt）。空的网页在所有浏览器里都只是一片空白，也没有任何东西可解析。
+    // 现在没标类型的只有 404 和跳转，本来就是空的；以后哪个带正文的处理函数忘了标，页面会直接变空白，
+    // 测试时一眼就能看出来，而不是悄悄被浏览器当成网页去解析。
     if !headers.contains_key(axum::http::header::CONTENT_TYPE) {
-        headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+        headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        *response.body_mut() = axum::body::Body::empty();
     }
+    let headers = response.headers_mut();
     // 只走 HTTPS。hub 永远在 HTTPS 反代后面；本机用 http 联调时浏览器会忽略这个头。
     headers.insert("strict-transport-security", HeaderValue::from_static("max-age=31536000"));
     if admin {
@@ -232,11 +238,17 @@ fn harden(response: &mut Response, admin: bool) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn empty_404_is_plain_text_not_a_download() {
+    #[tokio::test]
+    async fn empty_404_is_a_blank_page_not_a_download() {
         let mut missing = StatusCode::NOT_FOUND.into_response();
         harden(&mut missing, false);
-        assert_eq!(missing.headers().get("content-type").unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(missing.headers().get("content-type").unwrap(), "text/html; charset=utf-8");
+        let mut unlabeled = StatusCode::OK.into_response();
+        *unlabeled.body_mut() = axum::body::Body::from("<script>x</script>");
+        harden(&mut unlabeled, false);
+        assert_eq!(unlabeled.headers().get("content-type").unwrap(), "text/html; charset=utf-8");
+        let left = axum::body::to_bytes(unlabeled.into_body(), 1024).await.unwrap();
+        assert!(left.is_empty(), "漏标类型的正文要清空，不留任何能解析的东西");
         let mut page = ([("content-type", "text/html; charset=utf-8")], "x").into_response();
         harden(&mut page, true);
         assert_eq!(page.headers().get("content-type").unwrap(), "text/html; charset=utf-8", "已有的不覆盖");

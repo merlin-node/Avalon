@@ -21,18 +21,23 @@ The hub runs in Docker and is reachable only through a Cloudflare Tunnel. An age
 
 > The interface is in Chinese.
 
-## Highlights
+## Features
 
-- **Light**: the hub uses under 10 MB of memory, the agent about 3 MB. Both are single static binaries
-- **No open ports**: the hub is served only through Cloudflare Tunnel and agents only connect outward, so a port scan finds nothing
-- **Agents only report**: no remote commands, terminal, file access or auto-update. Even a compromised hub cannot reach your servers
-- **Hidden admin panel**: the panel lives at a random path you choose and everything else is a blank 404. Three wrong passwords block the address for 48 hours
-- **Status page and panel apart**: the public status page and the panel use separate domains, and visitors see no trace of the panel
-- **Accurate traffic**: billed per server from its own reset day, four counting modes, manual correction
-- **Alerts that matter**: a server is reported offline only after a grace period, and many going down together arrive as one message. Renewal reminders and optional auto-renewal
-- **Good looking**: 11 color palettes switched from the panel, with light and dark modes
-- **No third parties**: country detection comes from Cloudflare, with no external IP database
-- **Works at home**: dynamic IPs, dual stack and no public ports are all fine
+### Lightweight
+
+- The hub uses under 10 MB of memory, with an image of about 30 MB
+- The agent uses about 3 MB of memory, with a binary of about 2 MB
+- Both are static single binaries written in Rust, with no runtime to install
+- The agent keeps nothing on disk. All history lives on the hub
+
+### Secure
+
+- No ports are opened. The hub is served only through Cloudflare Tunnel and agents only connect outward, so scanning the server IP finds nothing
+- Agents only report data. There are no remote commands, terminal, file access or auto-update, so even a compromised hub cannot reach your servers
+- The agent runs as a dedicated unprivileged user inside a systemd sandbox
+- The panel lives at a random path you choose, every other path is a blank 404, and three wrong passwords block the address for 48 hours
+- The public status page and the panel use separate domains, and visitors see no trace of the panel
+- Country detection comes from Cloudflare, and node IPs are never sent to an outside service
 
 ## Deployment
 
