@@ -324,12 +324,22 @@ enum Outcome {
     Skip,
 }
 
+/// 只测公网地址。主控万一被人拿下，对方能让被控去连的也只有公网：本机（127.0.0.1）、
+/// 所在的内网（10.x、192.168.x……）、云厂商的元数据地址（169.254.169.254）一律不连，
+/// 被控不会变成扫它自己内网的工具。看的是解析出来的地址，域名指向内网也一样挡住。
+fn public_target(address: &SocketAddr) -> bool {
+    match address.ip() {
+        IpAddr::V4(ip) => public_v4(ip),
+        IpAddr::V6(ip) => public_v6(ip),
+    }
+}
+
 /// 一次探测。解析时间不计入延迟：只有连接那一段才是要测的东西。
 fn check(task: &Task) -> Outcome {
     let started = Instant::now();
     let Ok(addresses) = (task.h.as_str(), task.p).to_socket_addrs() else { return Outcome::Loss };
     if started.elapsed() > RESOLVE_BUDGET { return Outcome::Skip; }
-    for address in addresses.take(MAX_ADDRESSES) {
+    for address in addresses.filter(public_target).take(MAX_ADDRESSES) {
         let at = Instant::now();
         if TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).is_ok() {
             return Outcome::Latency(at.elapsed().as_secs_f64() * 1000.0);
@@ -633,6 +643,20 @@ fe800000000000000000000000000001 02 40 20 80 eth0
     fn unreachable_target_is_loss() {
         let task = Task { i: 1, h: "127.0.0.1".into(), p: 1, s: 60 };
         assert!(matches!(check(&task), Outcome::Loss));
+    }
+
+    /// 本机明明有端口开着也不连：非公网地址一律当丢包，不去探。
+    #[test]
+    fn private_targets_are_never_dialed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = Task { i: 1, h: "127.0.0.1".into(), p: port, s: 60 };
+        assert!(matches!(check(&task), Outcome::Loss));
+        for private in ["10.0.0.1:80", "192.168.1.1:80", "169.254.169.254:80", "[::1]:80", "[fe80::1]:80"] {
+            assert!(!public_target(&private.parse().unwrap()), "{private} 不该连");
+        }
+        assert!(public_target(&"1.1.1.1:443".parse().unwrap()));
+        assert!(public_target(&"[2606:4700:4700::1111]:443".parse().unwrap()));
     }
 
     #[test]

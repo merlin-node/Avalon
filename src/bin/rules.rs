@@ -128,10 +128,10 @@ pub(super) fn number(text: &str, min: i64, max: i64) -> Result<Option<i64>, ()> 
 }
 
 /// 超标 / 恢复的判断。values 是最近的采样（最多 WINDOW 个），was 是上一次的状态。
-/// 超标要 NEED 个超过阈值，恢复要 NEED 个回到阈值以下；够不上就保持原状，
+/// 超标要 NEED 个达到阈值（填 100 就是跑满），恢复要 NEED 个回到阈值以下；够不上就保持原状，
 /// 数值在阈值上下晃也不会来回发。采样不够（刚上线、刚重启）时也保持原状。
 pub(super) fn judge(was: bool, values: &[f64], limit: f64) -> bool {
-    let over = values.iter().filter(|v| **v > limit).count();
+    let over = values.iter().filter(|v| **v >= limit).count();
     let under = values.len() - over;
     if was { under < NEED } else { over >= NEED }
 }
@@ -178,7 +178,8 @@ mod tests {
         assert!(!judge(false, &sample(7, 3), 90.0));
         assert!(judge(false, &sample(8, 2), 90.0), "10 分钟里 8 分钟超才算");
         assert!(!judge(false, &sample(7, 0), 90.0), "采样不够 8 个时不报");
-        assert!(!judge(false, &[90.0; 10], 90.0), "等于阈值不算超过");
+        assert!(judge(false, &[90.0; 10], 90.0), "达到阈值就算，填 100 才能报跑满");
+        assert!(!judge(false, &[89.9; 10], 90.0));
     }
 
     #[test]

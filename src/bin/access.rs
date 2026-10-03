@@ -147,11 +147,18 @@ pub(super) async fn gate(State(state): State<App>, mut request: Request, next: N
     // 经过反代或 Tunnel 的请求一定带其中一个头；都没有才是容器里的健康检查。
     let local = !request.headers().contains_key("x-forwarded-for") && !request.headers().contains_key("cf-connecting-ip");
     let route = classify(&path, &admin_path());
+    let is_admin = matches!(route, Route::Admin(_));
     // 主域名上的公开内容是凭登录才给的（设了展示页域名、或公开页关着的时候）。
     let personal = matches!(route, Route::Public) && !on_display && !(display.is_empty() && public_enabled());
     let allowed = match route {
         Route::Admin(internal) => {
             if on_display {
+                false
+            } else if request.method() != Method::GET && request.method() != Method::HEAD
+                && !matches!(internal.as_str(), "/admin/login" | "/admin/theme")
+                && !logged_in(&state, request.headers()) {
+                // 后台的写操作只有登录和亮暗切换不要登录。其余的没登录就在这里回 404，
+                // 连请求体都不读：上传恢复最大 128 MB，不能让知道后台地址的人随便往里灌。
                 false
             } else {
                 let query = request.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
@@ -180,7 +187,8 @@ pub(super) async fn gate(State(state): State<App>, mut request: Request, next: N
             }
         }
     };
-    let admin = allowed && request.uri().path().starts_with("/admin");
+    // 只认真正路由到后台的请求。按路径前缀判断的话，「/adminx」这种公开路径也会被当成后台。
+    let admin = allowed && is_admin;
     // 后台页面的亮暗按 cookie 定，处理请求期间 frame() 直接读得到。
     let look = admin::look_from(request.headers());
     let mut response = if allowed { admin::LOOK.scope(look, next.run(request)).await } else { StatusCode::NOT_FOUND.into_response() };

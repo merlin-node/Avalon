@@ -61,7 +61,8 @@ case "$SERVER" in *[!A-Za-z0-9.:/_-]*) die "--server 含有非法字符" ;; esac
 SERVER=${SERVER%/}
 case "$SERVER" in
     https://?*) ;;
-    http://127.0.0.1*|http://localhost*) ;;
+    # 只认回环本身（可带端口）。写成 http://127.0.0.1* 的话，http://127.0.0.1.example.com 也会被放过去。
+    http://127.0.0.1|http://127.0.0.1:*|http://localhost|http://localhost:*) ;;
     *) die "--server 必须是 https:// 地址，明文 http 只允许本机回环" ;;
 esac
 

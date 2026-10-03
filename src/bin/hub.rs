@@ -518,7 +518,9 @@ async fn agent(Path(id): Path<String>, State(state): State<App>, headers: Header
     let Ok(ws) = ws else { return StatusCode::NOT_FOUND.into_response() };
     let observed = observed_ip(&headers);
     let country = cf_country(&headers);
-    ws.on_upgrade(move |socket| receive(socket, state.db_path, id, token, observed, country)).into_response()
+    // 一条上报几百字节，下面收到超过 8 KB 也会断开。这里再从帧的层面卡住，大帧不会先被整个收进内存。
+    ws.max_message_size(64 * 1024).max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| receive(socket, state.db_path, id, token, observed, country)).into_response()
 }
 
 /// 旧版 agent 直接发裸 Metrics，没有 `t` 字段。留一条兼容路径，hub 可以先升级。

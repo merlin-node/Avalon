@@ -7,9 +7,9 @@ on:
   push:
     branches: [main]
 
+# 默认只读。只有最后推镜像那一步拿得到写 ghcr 的权限，跑测试、编译、装依赖的步骤都碰不到。
 permissions:
   contents: read
-  packages: write
 
 # 连续推好几次时只构建最后一次，不排长队
 concurrency:
@@ -20,10 +20,12 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: 检查 Cargo.lock
         run: test -f Cargo.lock || { echo "::error::仓库里缺 Cargo.lock，测试和构建都靠它锁定依赖版本"; exit 1; }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
@@ -32,10 +34,37 @@ jobs:
       - name: 构建主题
         working-directory: theme
         run: npm ci && npm run build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        # 钉成提交号以后它从 @ 后面认不出要装哪个版本，要明写
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: 测试
         run: cargo test --locked
+
+  # 依赖漏洞检查：Rust 依赖对照 RustSec 公告库，主题依赖对照 npm 公告库。
+  # 单独一个任务，不挡构建：哪天冒出新公告，这一项变红、GitHub 发邮件提醒，镜像照常出。
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        # 钉成提交号以后它从 @ 后面认不出要装哪个版本，要明写
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2
+        with:
+          tool: cargo-audit
+      - name: Rust 依赖
+        run: cargo audit
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: 主题依赖
+        working-directory: theme
+        run: npm audit --omit=dev --audit-level=high
 
   build:
     needs: test
@@ -49,8 +78,10 @@ jobs:
           - target: aarch64-unknown-linux-musl
             arch: arm64
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
@@ -59,11 +90,12 @@ jobs:
       - name: 构建主题
         working-directory: theme
         run: npm ci && npm run build
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       # cross 在容器里编译，自带目标架构的 C 编译器（SQLite 和加密库都有 C 代码）
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2
         with:
           tool: cross
       - name: 编译
@@ -74,26 +106,31 @@ jobs:
           cp target/${{ matrix.target }}/release/probe-hub dist/probe-hub-linux-${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/probe-agent dist/probe-agent-linux-${{ matrix.arch }}
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bin-${{ matrix.arch }}
           path: dist/
           retention-days: 7
 
   image:
+    permissions:
+      contents: read
+      packages: write
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: bin-*
           path: dist
           merge-multiple: true
       - run: chmod 755 dist/probe-*
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -103,7 +140,7 @@ jobs:
         run: |
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
           echo "SHORT=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: deploy/Dockerfile

@@ -368,6 +368,17 @@ fn parse_target(input:&str)->Option<(String,u16)> {
     (port>0 && shape).then_some((host,port))
 }
 
+/// 目标直接写成 IP 时，只收公网地址。被控那边对解析出来的地址还会再挡一次（域名指向内网也不连），
+/// 这里先在后台就说清楚，免得存进去一个永远是丢包的监控。
+fn public_target(host:&str)->bool {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip))=>public_v4(ip),
+        Ok(std::net::IpAddr::V6(ip))=>public_v6(ip),
+        Err(_)=>!(host.eq_ignore_ascii_case("localhost")||host.to_ascii_lowercase().ends_with(".localhost")),
+    }
+}
+const PRIVATE_TARGET:&str="只能测公网地址：本机、内网和保留地址被控不会去连";
+
 /// 改账号和密码。要先输当前密码；新密码留空表示只改账号。
 /// 登录设备。本机不给踢出按钮，要走就用退出登录；新设备的按钮是灰的，服务端也会拒绝。
 fn sessions_section(conn:&Connection,csrf:&str,current:&str,manage:bool)->String {
@@ -730,6 +741,11 @@ pub(super) async fn login(State(state):State<App>,headers:HeaderMap,Form(form):F
     let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     let source=client(&headers);
     if locked(&conn,&source) {return failure(StatusCode::TOO_MANY_REQUESTS,"该地址登录失败次数过多，请 48 小时后再试");}
+    // 账号最长 32、密码最长 128（改密码时就这么限的），超长的直接算一次失败，不拿去跑 argon2。
+    if form.username.len()>64||form.password.len()>128 {
+        record_failure(&conn,&source);
+        return failure(StatusCode::UNAUTHORIZED,"账号或密码错误");
+    }
     // argon2 是故意算得慢的，同时只放一个进去；排队而不是直接拒绝，
     // 否则两个人同时点一下登录就有一个吃 429。
     let Ok(Ok(permit))=tokio::time::timeout(Duration::from_secs(3),LOGIN_GATE.acquire()).await else {
@@ -975,8 +991,9 @@ fn delete_node(conn:&mut Connection,id:&str,confirmed:bool)->Response {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
-    // 提醒状态的键都是「种类:节点 id」（node、expire、traffic、cpu、memory、disk、load）。id 只有十六进制字符。
-    let removed=tx.execute("DELETE FROM alert_state WHERE key LIKE '%:'||?",[id])
+    // 提醒状态的键都是「种类:节点 id」，逐个写全，不用 LIKE 通配。
+    let keys=["node","expire","traffic","cpu","memory","disk","load"].map(|kind|format!("{kind}:{id}"));
+    let removed=tx.execute("DELETE FROM alert_state WHERE key IN (?,?,?,?,?,?,?)",rusqlite::params_from_iter(keys.iter()))
         .and_then(|_|tx.execute("DELETE FROM nodes WHERE id=?",[id]));
     match removed {Ok(1)=>(),Ok(_)=>return StatusCode::NOT_FOUND.into_response(),Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()}
     if tx.commit().is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
@@ -1003,6 +1020,7 @@ pub(super) async fn add_monitor(State(state):State<App>,headers:HeaderMap,body:S
     if !authorized(&headers,&conn,one(&fields,"csrf")){return StatusCode::FORBIDDEN.into_response();}
     let name=one(&fields,"name").trim().to_string();
     let Some((host,port))=parse_target(one(&fields,"target")) else {return failure(StatusCode::BAD_REQUEST,"目标地址要写成 host:port，IPv6 写成 [地址]:端口");};
+    if !public_target(&host) {return failure(StatusCode::BAD_REQUEST,PRIVATE_TARGET);}
     let interval:i64=one(&fields,"interval").parse().unwrap_or(60);
     if name.is_empty()||name.chars().count()>40||!(ping::MIN_INTERVAL..=ping::MAX_INTERVAL).contains(&interval) {
         return failure(StatusCode::BAD_REQUEST,"名称需要 1–40 个字，间隔需要在 5–3600 秒之间");
@@ -1040,6 +1058,7 @@ pub(super) async fn edit_monitor(Path(id):Path<i64>,State(state):State<App>,head
     }
     let name=one(&fields,"name").trim().to_string();
     let Some((host,port))=parse_target(one(&fields,"target")) else {return failure(StatusCode::BAD_REQUEST,"目标地址要写成 host:port，IPv6 写成 [地址]:端口");};
+    if !public_target(&host) {return failure(StatusCode::BAD_REQUEST,PRIVATE_TARGET);}
     let interval:i64=one(&fields,"interval").parse().unwrap_or(60);
     if name.is_empty()||name.chars().count()>40||!(ping::MIN_INTERVAL..=ping::MAX_INTERVAL).contains(&interval) {
         return failure(StatusCode::BAD_REQUEST,"名称需要 1–40 个字，间隔需要在 5–3600 秒之间");
@@ -1281,17 +1300,45 @@ async fn check_round(path:&str)->Result<(),Box<dyn Error>>{
     };
     let total=nodes.len();
     let (mut went_off,mut came_on)=(Vec::new(),Vec::new());
-    for (id,name,seen,notify,grace) in nodes {
-        let online=online_for_alerts(seen,now(),grace);
-        let Some(state)=transition(path,&format!("node:{id}"),online)? else {continue};
-        if !notify {continue}
-        if state {came_on.push(name)} else {went_off.push(name)}
-    }
-    for msg in compose_alerts(&went_off,&came_on,total) {
-        if let Err(e)=send_telegram(path,&msg).await {
-            if !e.contains("请先保存") {eprintln!("Telegram notification failed: {e}");}
+    // 要发通知的状态变化先不落库，发出去了才记。Telegram 恰好连不上时，下一轮还能看出变化、再发一次。
+    let mut pending:Vec<(String,i64)>=Vec::new();
+    {
+        let conn=db(path)?;
+        for (id,name,seen,notify,grace) in nodes {
+            let key=format!("node:{id}");
+            let online=online_for_alerts(seen,now(),grace) as i64;
+            let old=read_state(&conn,&key)?;
+            if old==Some(online) {continue}
+            // 第一次见到、或者不归任何规则的：只记状态，不发。
+            if old.is_none()||!notify {write_state(&conn,&key,online)?; continue}
+            pending.push((key,online));
+            if online==1 {came_on.push(name)} else {went_off.push(name)}
         }
     }
+    let lines=compose_alerts(&went_off,&came_on,total);
+    deliver(path,&lines,&pending).await
+}
+
+/// 提醒的状态，键是「种类:节点 id」。没有记录是 None。
+fn read_state(conn:&Connection,key:&str)->rusqlite::Result<Option<i64>> {
+    conn.query_row("SELECT state FROM alert_state WHERE key=?",[key],|r|r.get(0)).optional()
+}
+fn write_state(conn:&Connection,key:&str,value:i64)->rusqlite::Result<()> {
+    conn.execute("INSERT INTO alert_state(key,state) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state",params![key,value])?;
+    Ok(())
+}
+/// 把这一轮的提醒合成一条发出去，发出去了才把对应的状态记下。没配 Telegram 也算处理过，
+/// 免得一直攒着；网络出错就什么都不记，下一轮重新判断、重新发——只要没发出去，就不会重复。
+async fn deliver(path:&str,lines:&[String],pending:&[(String,i64)])->Result<(),Box<dyn Error>> {
+    if let Some(text)=rules::bundle(lines) {
+        match send_telegram(path,&text).await {
+            Ok(())=>{}
+            Err(e) if e.contains("请先保存")=>{}
+            Err(e)=>{eprintln!("Telegram notification failed: {e}"); return Ok(())}
+        }
+    }
+    let conn=db(path)?;
+    for (key,value) in pending {write_state(&conn,key,*value)?;}
     Ok(())
 }
 /// 到期提醒与自动续期。跟掉线检查一起每 30 秒跑一轮，但只在 hub 本地时间
@@ -1357,30 +1404,27 @@ async fn expiry_round(path:&str)->Result<(),Box<dyn Error>>{
     Ok(())
 }
 
-/// 资源监控的流量、CPU、内存、磁盘、负载提醒。跟掉线检查一起每 30 秒跑一轮，同一轮的提醒合成一条发。
-/// 状态先落库再发：发不出去这一条就丢了，不会每 30 秒重发刷屏（和掉线通知一样）。
+/// 资源监控的流量、CPU、内存、磁盘、负载提醒。跟掉线检查一起每 30 秒跑一轮，同一轮的提醒合成一条发，
+/// 发出去了才记状态（见 deliver）。
 async fn resource_round(path:&str)->Result<(),Box<dyn Error>>{
-    let lines=resource_lines(&db(path)?)?;
-    let Some(text)=rules::bundle(&lines) else {return Ok(())};
-    if let Err(e)=send_telegram(path,&text).await {
-        if !e.contains("请先保存") {eprintln!("Telegram notification failed: {e}");}
-    }
-    Ok(())
+    let (lines,pending)=resource_lines(&db(path)?)?;
+    deliver(path,&lines,&pending).await
 }
 
-/// 算出这一轮该发的提醒，并把新状态记下。不归规则、或规则里这一项留空的，状态悄悄清零，
+/// 算出这一轮该发的提醒和发出去之后要记的状态。不归规则、或规则里这一项留空的，状态当场悄悄清零，
 /// 以后再打开时不会冒出一条「已恢复」。
-fn resource_lines(conn:&Connection)->rusqlite::Result<Vec<String>> {
+fn resource_lines(conn:&Connection)->rusqlite::Result<(Vec<String>,Vec<(String,i64)>)> {
     let members=rules::by_node(conn)?;
     let today=local_today(conn)?;
     let at=now();
     let mut lines=Vec::new();
+    let mut pending:Vec<(String,i64)>=Vec::new();
     let mut stmt=conn.prepare("SELECT n.id,n.name,n.last_seen,COALESCE(d.cpu_cores,0),COALESCE(c.traffic_limit,0),COALESCE(c.traffic_mode,''),COALESCE(c.traffic_reset_day,1)
         FROM nodes n LEFT JOIN details d ON d.node_id=n.id LEFT JOIN node_config c ON c.node_id=n.id ORDER BY n.sort,n.name")?;
     let nodes=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let state=|key:&str|->rusqlite::Result<i64> {Ok(conn.query_row("SELECT state FROM alert_state WHERE key=?",[key],|r|r.get(0)).optional()?.unwrap_or(0))};
-    let store=|key:&str,value:i64|conn.execute("INSERT INTO alert_state(key,state) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state",params![key,value]);
+    let state=|key:&str|->rusqlite::Result<i64> {Ok(read_state(conn,key)?.unwrap_or(0))};
+    let store=|key:&str,value:i64|write_state(conn,key,value);
     for (id,name,seen,cores,limit,mode,reset) in nodes {
         let rule=members.get(&id);
         // 流量：每个周期到阈值一次、用完一次。状态存「周期起始日 × 10 + 已发到第几级」，进了新周期自动作废。
@@ -1394,7 +1438,7 @@ fn resource_lines(conn:&Connection)->rusqlite::Result<Vec<String>> {
                 let old=state(&key)?;
                 let sent=if old/10==start {old%10} else {0};
                 if i64::from(level)>sent {
-                    store(&key,start*10+i64::from(level))?;
+                    pending.push((key.clone(),start*10+i64::from(level)));
                     let percent=(used as f64*100.0/limit as f64).round() as i64;
                     lines.push(if level==2 {
                         format!("节点 {name} 本期流量已用完：{} / {} GB",gb(used),gb(limit))
@@ -1425,16 +1469,16 @@ fn resource_lines(conn:&Connection)->rusqlite::Result<Vec<String>> {
             let values:Vec<f64>=recent.iter().map(|v|if column==3 {v[3]*100.0/cores as f64} else {v[column]}).take(rules::WINDOW).collect();
             let now_over=rules::judge(was,&values,limit as f64);
             if now_over==was {continue}
-            store(&key,now_over as i64)?;
+            pending.push((key.clone(),now_over as i64));
             let current=values.first().map_or(0,|v|v.round() as i64);
             lines.push(if now_over {
-                format!("节点 {name} {label}持续超过 {limit}%，现在 {current}%")
+                format!("节点 {name} {label}持续在 {limit}% 以上，现在 {current}%")
             } else {
                 format!("节点 {name} {label}已恢复，现在 {current}%")
             });
         }
     }
-    Ok(lines)
+    Ok((lines,pending))
 }
 
 fn reminder(name:&str,date:expiry::Date,left:i64,renewable:bool)->String {
@@ -1446,12 +1490,6 @@ fn reminder(name:&str,date:expiry::Date,left:i64,renewable:bool)->String {
     }
 }
 
-fn transition(path:&str,key:&str,value:bool)->rusqlite::Result<Option<bool>>{
-    let conn=db(path)?;
-    let old:Option<i64>=conn.query_row("SELECT state FROM alert_state WHERE key=?",[key],|r|r.get(0)).optional()?;
-    conn.execute("INSERT INTO alert_state(key,state) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state",params![key,value as i64])?;
-    Ok(old.and_then(|o| (o!=value as i64).then_some(value)))
-}
 
 #[cfg(test)]
 mod tests {
@@ -1724,6 +1762,16 @@ mod tests {
         assert_eq!(opened(None),"");
         assert!(card("site","站点",false,"x").contains("<details class=\"card\" id=\"site\">"));
         assert!(card("site","站点",true,"x").contains("id=\"site\" open>"),"带上 open 属性才是展开的");
+    }
+
+    #[test]
+    fn only_public_targets() {
+        assert!(public_target("1.1.1.1"));
+        assert!(public_target("2606:4700:4700::1111"));
+        assert!(public_target("example.com"),"域名放行，被控按解析结果再挡");
+        for private in ["127.0.0.1","10.0.0.1","192.168.1.1","169.254.169.254","::1","fe80::1","localhost","a.localhost"] {
+            assert!(!public_target(private),"{private} 不收");
+        }
     }
 
     #[test]
