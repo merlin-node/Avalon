@@ -182,7 +182,14 @@ function Details({ node, chart }: { node: Node; chart: boolean }) {
         </Line>
         <Line label="硬盘">{m ? usage(m.disk_used, m.disk_total) : bytes(node.disk_total)}</Line>
 
-        <Line label="负载">{m ? m.load.map((n) => n.toFixed(2)).join(" / ") : "—"}</Line>
+        {/* The 1-minute figure over the core count: 100% is every core busy, above it
+            work is queueing, so it is not capped. Waiting on the disk counts too, which
+            is why it can sit well above the CPU percentage. */}
+        <Line label="负载">
+          {m
+            ? `${m.load.map((n) => n.toFixed(2)).join(" / ")}${node.cpu_cores > 0 ? `（${Math.round((m.load[0] / node.cpu_cores) * 100)}%）` : ""}`
+            : "—"}
+        </Line>
         <Line label="进程 / 连接">{m && (m.procs || m.tcp || m.udp) ? `${m.procs} · TCP ${m.tcp} · UDP ${m.udp}` : "—"}</Line>
         <Line label="网速">{m ? `↓ ${speedRate(m.net_rx)} · ↑ ${speedRate(m.net_tx)}` : "—"}</Line>
 
