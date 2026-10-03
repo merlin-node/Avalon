@@ -2,14 +2,14 @@
 //! 读写数据库和发通知在 admin.rs 的巡检里。全部按 hub 所在时区的日历日计算。
 //!
 //! 规则：
-//! - 到期前 REMIND_DAYS 天起每天提醒一次，到期当天也提醒；
+//! - 到期前若干天起每天提醒一次（资源监控里每套规则自己设，1–7 天），到期当天也提醒；
 //! - 跨过到期日后，节点开着自动续期、周期不是一次性、且此刻在线，就按周期往后顺延；
 //! - 不在线不顺延（机器可能已经退了），一次性账单不顺延；
 //! - 过期了还在线、但没法自动续期的（手动续费或一次性），继续每天提醒。
 
 use std::fmt;
 
-/// 提前几天开始每天提醒。
+/// 节点不归任何规则、或规则里没填到期提前时，判断续期用的天数（这时不发提醒，只决定续不续）。
 pub(super) const REMIND_DAYS: i64 = 7;
 /// hub 本地时间几点之后才动作，免得半夜吵人。
 pub(super) const REMIND_HOUR: i64 = 9;
@@ -118,10 +118,10 @@ pub(super) enum Action {
     Renew(Date),
 }
 
-pub(super) fn decide(expires: Date, today: Date, cycle: &str, auto: bool, online: bool) -> Action {
+pub(super) fn decide(expires: Date, today: Date, cycle: &str, auto: bool, online: bool, remind_days: i64) -> Action {
     let left = expires.number() - today.number();
     if left >= 0 {
-        return if left <= REMIND_DAYS { Action::Remind(left) } else { Action::Nothing };
+        return if left <= remind_days { Action::Remind(left) } else { Action::Nothing };
     }
     if auto && online {
         if let Some(months) = cycle_months(cycle) {
@@ -162,20 +162,22 @@ mod tests {
     #[test]
     fn reminds_daily_in_the_last_week() {
         let expires = date("2026-10-01");
-        assert_eq!(decide(expires, date("2026-09-23"), "monthly", true, true), Action::Nothing, "还有 8 天");
-        assert_eq!(decide(expires, date("2026-09-24"), "monthly", true, true), Action::Remind(7));
-        assert_eq!(decide(expires, date("2026-10-01"), "monthly", true, false), Action::Remind(0), "到期当天不管在不在线都提醒");
+        assert_eq!(decide(expires, date("2026-09-23"), "monthly", true, true, 7), Action::Nothing, "还有 8 天");
+        assert_eq!(decide(expires, date("2026-09-24"), "monthly", true, true, 7), Action::Remind(7));
+        assert_eq!(decide(expires, date("2026-10-01"), "monthly", true, false, 7), Action::Remind(0), "到期当天不管在不在线都提醒");
+        assert_eq!(decide(expires, date("2026-09-28"), "monthly", true, true, 3), Action::Remind(3), "规则里填 3 天");
+        assert_eq!(decide(expires, date("2026-09-27"), "monthly", true, true, 3), Action::Nothing, "还有 4 天，没到 3 天");
     }
 
     #[test]
     fn renews_only_when_online_and_periodic() {
         let expires = date("2026-10-01");
         let next_day = date("2026-10-02");
-        assert_eq!(decide(expires, next_day, "monthly", true, true), Action::Renew(date("2026-11-01")));
-        assert_eq!(decide(expires, next_day, "yearly", true, true), Action::Renew(date("2027-10-01")));
-        assert_eq!(decide(expires, next_day, "monthly", true, false), Action::Nothing, "离线不续，也不打扰");
-        assert_eq!(decide(expires, next_day, "once", true, true), Action::Remind(-1), "一次性不续，在线就继续提醒");
-        assert_eq!(decide(expires, next_day, "monthly", false, true), Action::Remind(-1), "关了自动续期");
+        assert_eq!(decide(expires, next_day, "monthly", true, true, 7), Action::Renew(date("2026-11-01")));
+        assert_eq!(decide(expires, next_day, "yearly", true, true, 7), Action::Renew(date("2027-10-01")));
+        assert_eq!(decide(expires, next_day, "monthly", true, false, 7), Action::Nothing, "离线不续，也不打扰");
+        assert_eq!(decide(expires, next_day, "once", true, true, 7), Action::Remind(-1), "一次性不续，在线就继续提醒");
+        assert_eq!(decide(expires, next_day, "monthly", false, true, 7), Action::Remind(-1), "关了自动续期");
     }
 
     #[test]
@@ -191,7 +193,7 @@ mod tests {
     #[test]
     fn catches_up_missed_periods() {
         assert_eq!(
-            decide(date("2026-01-31"), date("2026-04-15"), "monthly", true, true),
+            decide(date("2026-01-31"), date("2026-04-15"), "monthly", true, true, 7),
             Action::Renew(date("2026-04-30")),
             "一次补齐，而且从原到期日算，不会漂成 28 号"
         );

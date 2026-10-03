@@ -30,6 +30,7 @@ mod admin;
 mod expiry;
 mod palette;
 mod ping;
+mod rules;
 mod site;
 
 /// 监控配置的版本号。后台改动后 +1，每个 agent 连接在下一次循环里发现版本变了就重发
@@ -138,6 +139,8 @@ fn init_db(path: &str) -> rusqlite::Result<()> {
     palette::init(&conn)?;
     access::init(&conn)?;
     migrate(&conn)?;
+    // 要在 migrate 之后：老库的 node_config 可能还没有 notify 这一列，规则表的升级要读它。
+    rules::init(&conn)?;
     Ok(())
 }
 
@@ -718,6 +721,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let conn = db(&path)?;
             conn.execute("INSERT INTO nodes(id,name,token,public,sort) VALUES (?,?,?,?,(SELECT COALESCE(MAX(sort),0)+1 FROM nodes))",params![id,name,token,!args.contains(&"--private".to_string())])?;
             ping::attach_auto(&conn, &id)?;
+            rules::attach_new(&conn, &id)?;
             println!("节点 ID: {id}\nToken: {token}\n仅显示一次，请妥善保管。");
         }
         Some("backup") => {
@@ -783,6 +787,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .route("/admin/monitors",post(admin::add_monitor))
                 .route("/admin/monitors/{id}",post(admin::edit_monitor))
                 .route("/admin/monitors/{id}/move",post(admin::move_monitor))
+                .route("/admin/rules",post(admin::add_rule))
+                .route("/admin/rules/{id}",post(admin::edit_rule))
+                .route("/admin/rules/{id}/move",post(admin::move_rule))
                 .route("/admin/settings",post(admin::save_settings))
                 .route("/admin/site",post(admin::save_site))
                 .route("/admin/palette",post(admin::save_palette))

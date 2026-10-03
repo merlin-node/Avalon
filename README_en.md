@@ -93,8 +93,8 @@ Open `https://<main domain>/admin`, sign in, then:
 
 1. **账号 (Account)**: set your own username and password
 2. **访问控制 (Access)**: set a random panel path (bookmark it right after saving, as `/admin` stops working), enter the status domain and open the public status page
-3. **Telegram 通知 (Telegram)**: enter the Bot Token and Chat ID and send a test
-4. **添加节点 (Add node)**: enter a name, run the generated command as root on that server, and it shows online within seconds
+3. **通知 (Notifications)**: under Telegram, enter the Bot Token and Chat ID and send a test; under 资源监控 (resource alerts) a 默认 (default) rule already exists, adjust its thresholds and machines as needed
+4. **节点管理 → 新增节点 (Nodes → Add node)**: enter a name, run the generated command as root on that server, and it shows online within seconds
 
 ## Everyday use
 

@@ -225,6 +225,7 @@ header{background:var(--head);border-bottom:1px solid var(--line);padding:14px m
 .swatch{display:flex;width:72px;height:14px;border-radius:7px;overflow:hidden;box-shadow:0 0 0 1px var(--line)}.swatch i{flex:1}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .look .to-light{display:grid}:root:not([data-theme="light"]) .look .to-dark{display:none}}
 :root[data-theme="dark"] .look .to-light{display:grid}:root[data-theme="dark"] .look .to-dark{display:none}
+.card>details{margin-top:14px}.picker input{accent-color:var(--btn)}.picker label:has(input:disabled){opacity:.45}.picker small{margin-left:2px}
 @media(max-width:600px){main{margin:12px auto}.card{padding:14px}}
 "#;
 /// 月亮去黑夜，太阳回白天；当前是哪边就只露出另一边的按钮。
@@ -278,6 +279,14 @@ fn failure(code:StatusCode,message:&str)->Response {(code,frame(&format!("<p>{}<
 /// 一张可折叠的卡片。用的是浏览器自带的 details，不需要 JS。
 fn card(id:&str,title:&str,open:bool,body:&str)->String {
     format!("<details class=\"card\" id=\"{id}\"{}><summary>{title}</summary>{body}</details>",if open {" open"} else {""})
+}
+/// 卡片里的一小块，也能收起展开，标题是浅色的小字（和「流量校正」一样）。
+fn part(id:&str,title:&str,open:bool,body:&str)->String {
+    format!("<details id=\"{id}\"{}><summary class=\"muted\">{title}</summary>{body}</details>",if open {" open"} else {""})
+}
+/// 列表最后那一行「新增」，排法和上面的每一行一样，只是没有上下箭头。
+fn new_row(anchor:&str,open:&str,form:&str)->String {
+    format!("<div class=\"node row\"><details id=\"{anchor}\"{}><summary class=\"muted\">新增</summary>{form}</details></div>",if open==anchor {" open"} else {""})
 }
 /// 保存完回后台首页。带上 ?open=… 让刚动过的那张卡片自己展开，同名的 #锚点
 /// 再让浏览器滚到它那儿——保存一次就得重新点开一遍，太烦。
@@ -566,10 +575,12 @@ fn monitor_form(conn:&Connection,csrf:&str,id:Option<i64>,name:&str,target:&str,
 <label>名称<input name="name" value="{}" maxlength="40" required></label>
 <label>目标地址 host:port<input name="target" value="{}" maxlength="270" placeholder="1.1.1.1:443" required></label>
 <label>间隔（秒）<input name="interval" type="number" min="{}" max="{}" value="{interval}"></label></div>
-<p class="muted" style="margin:14px 0 0">运行节点</p>{}
-<div class="actions"><label><input type="checkbox" name="auto_join" value="1" {}>新节点自动加入</label><button>{submit}</button>{remove}</div></form>"#,
+{}
+<div class="actions">{}<button>{submit}</button>{remove}</div></form>"#,
         esc(name),esc(target),ping::MIN_INTERVAL,ping::MAX_INTERVAL,
-        node_picker(conn,chosen),if auto {"checked"} else {""})
+        // 新增时不选机器：加完自动展开那一条，在那里选好再保存。
+        if id.is_some() {format!("<p class=\"muted\" style=\"margin:14px 0 0\">运行节点</p>{}",node_picker(conn,chosen))} else {String::new()},
+        if id.is_some() {format!("<label><input type=\"checkbox\" name=\"auto_join\" value=\"1\" {}>新节点自动加入</label>",if auto {"checked"} else {""})} else {String::new()})
 }
 
 fn monitors_section(conn:&Connection,csrf:&str,open:&str)->String {
@@ -594,6 +605,63 @@ fn monitors_section(conn:&Connection,csrf:&str,open:&str)->String {
     body
 }
 
+/// 一套资源监控的表单。新增时不选机器；已有的规则里，被别的规则占着的机器打着勾、变灰、点不动，
+/// 后面写着它在哪套里（灰掉的复选框浏览器不会提交，服务端另有主键兜底）。
+fn rule_form(conn:&Connection,csrf:&str,rule:Option<&rules::Rule>,members:&HashMap<String,rules::Rule>)->String {
+    let blank=rules::Rule{grace:rules::DEFAULT_GRACE,expire:Some(rules::MAX_EXPIRE),..Default::default()};
+    let r=rule.unwrap_or(&blank);
+    let action=rule.map(|r|format!("/admin/rules/{}",r.id)).unwrap_or_else(||"/admin/rules".into());
+    let value=|v:Option<i64>|v.map(|v|v.to_string()).unwrap_or_default();
+    let field=|label:&str,key:&str,min:i64,max:i64,v:Option<i64>|format!(r#"<label>{label}<input type="number" name="{key}" min="{min}" max="{max}" value="{}" placeholder="{min}–{max}"></label>"#,value(v));
+    let fields=[
+        field("掉线宽限（分钟）","grace",0,rules::MAX_GRACE,Some(r.grace)),
+        field("到期提前（天）","expire",1,rules::MAX_EXPIRE,r.expire),
+        field("流量（%）","traffic",1,100,r.traffic),
+        field("CPU（%）","cpu",1,100,r.cpu),
+        field("内存（%）","memory",1,100,r.memory),
+        field("磁盘（%）","disk",1,100,r.disk),
+        field("负载（%）","load",1,rules::MAX_LOAD,r.load),
+    ].concat();
+    let picker=match rule {
+        None=>String::new(),
+        Some(rule)=>{
+            let mut html=String::from("<p class=\"muted\" style=\"margin:14px 0 0\">节点</p><div class=\"picker\">");
+            if let Ok(mut stmt)=conn.prepare("SELECT id,name FROM nodes ORDER BY sort,name") {
+                if let Ok(rows)=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))) {
+                    for (id,name) in rows.flatten() {
+                        html.push_str(&match members.get(&id) {
+                            Some(owner) if owner.id==rule.id=>format!("<label><input type=\"checkbox\" name=\"nodes\" value=\"{}\" checked>{}</label>",esc(&id),esc(&name)),
+                            Some(owner)=>format!("<label><input type=\"checkbox\" checked disabled>{}<small>（{}）</small></label>",esc(&name),esc(&owner.name)),
+                            None=>format!("<label><input type=\"checkbox\" name=\"nodes\" value=\"{}\">{}</label>",esc(&id),esc(&name)),
+                        });
+                    }
+                }
+            }
+            html.push_str("</div>");
+            html
+        }
+    };
+    let buttons=if rule.is_some() {"<button>保存监控</button><button class=\"danger\" name=\"delete\" value=\"1\" formnovalidate>删除监控</button>"} else {"<button>添加监控</button>"};
+    format!(r#"<form method="post" action="{action}"><input type="hidden" name="csrf" value="{csrf}"><div class="grid"><label>名称<input name="name" value="{}" maxlength="40" required></label>{fields}</div>{picker}<div class="actions">{buttons}</div></form>"#,esc(&r.name))
+}
+
+fn rules_section(conn:&Connection,csrf:&str,open:&str)->String {
+    let list=rules::all(conn).unwrap_or_default();
+    let members=rules::by_node(conn).unwrap_or_default();
+    let mut body=String::new();
+    if list.is_empty() {body.push_str("<p class=\"muted\">还没有资源监控，所有机器都不发提醒。</p>");}
+    let count=list.len();
+    for (index,rule) in list.iter().enumerate() {
+        let anchor=format!("r-{}",rule.id);
+        let size=members.values().filter(|r|r.id==rule.id).count();
+        body.push_str(&format!("<div class=\"node row\"><details id=\"{anchor}\"{}><summary>{} <small>· {size} 个节点</small></summary>{}</details>{}</div>",
+            if open==anchor {" open"} else {""},esc(&rule.name),rule_form(conn,csrf,Some(rule),&members),
+            mover(&format!("/admin/rules/{}/move",rule.id),csrf,index,count)));
+    }
+    body.push_str(&new_row("r-new",open,&rule_form(conn,csrf,None,&members)));
+    body
+}
+
 #[derive(Deserialize)] pub(super) struct Panel {open:Option<String>}
 pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):Query<Panel>)->Response {
     let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
@@ -613,7 +681,7 @@ pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):
     let rows:Vec<_>=match rows {Ok(rows)=>rows.flatten().collect(),Err(_)=>Vec::new()};
     let count=rows.len();
     for (index,row) in rows.into_iter().enumerate() {
-        let (id,name,public,seen,token,country,ip,notify,remark,price,currency,cycle,expires,limit,mode,reset,monitors,auto_renew,total_rx,total_tx)=row;
+        let (id,name,public,seen,token,country,ip,_notify,remark,price,currency,cycle,expires,limit,mode,reset,monitors,auto_renew,total_rx,total_tx)=row;
         let (month_rx,month_tx)=today.and_then(|today|period_usage(&conn,&id,reset,today).ok()).unwrap_or((0,0));
         let limit_text=if limit>0 {gb(limit)} else {String::new()};
         let cycle_select=cycle_picker(&cycle);
@@ -630,25 +698,26 @@ pub(super) async fn page(State(state):State<App>,headers:HeaderMap,Query(query):
 <label>名称<input name="name" value="{}" maxlength="80" required></label><label>国家/地区<input name="country" value="{}" maxlength="2" placeholder="{country_hint}"></label><label>手填 IP<input name="display_ip" value="{}" maxlength="100"></label><label>备注<input name="remark" value="{}" maxlength="300"></label><label>价格<input name="price" type="number" min="0" step="0.01" value="{}"></label><label>货币<input name="currency" value="{}" maxlength="8" placeholder="$"></label><label>计费周期{}</label><label>到期日期<input name="expires_at" type="date" value="{}"></label><label>每月额度（GB）<input name="traffic_limit" type="number" min="0" step="0.01" value="{}" placeholder="不限"></label><label>计算方式{}</label><label>流量重置日<input name="traffic_reset_day" type="number" min="1" max="31" value="{}"></label></div>
 <details><summary class="muted">流量校正</summary><div class="grid">
 <label>总下行（GB）<input name="fix_total_rx" type="number" min="0" step="0.01" placeholder="现在 {}"></label><label>总上行（GB）<input name="fix_total_tx" type="number" min="0" step="0.01" placeholder="现在 {}"></label>
-<label>本期下行（GB）<input name="fix_month_rx" type="number" min="0" step="0.01" placeholder="现在 {}"></label><label>本期上行（GB）<input name="fix_month_tx" type="number" min="0" step="0.01" placeholder="现在 {}"></label></div></details><div class="actions"><label><input type="checkbox" name="public" value="1" {}>公开显示</label><label><input type="checkbox" name="notify" value="1" {}>掉线/到期通知</label><label><input type="checkbox" name="auto_renew" value="1" {}>到期后仍在线自动续期</label><button>保存节点</button><button class="secondary" name="action" value="rotate" formnovalidate>重新生成 Token</button><label><input type="checkbox" name="confirm" value="1">确认</label><button class="danger" name="action" value="delete" formnovalidate>删除节点</button></div></form></details>{arrows}</div>"#,
-        esc(&name),if public==1 {"公开"} else {"私有"},ip_line(&conn,&id),esc(&install_command(&base,&id,&token)),esc(&uninstall_command()),esc(&id),csrf,esc(&name),esc(&country),esc(&ip),esc(&remark),price,esc(&currency),cycle_select,esc(&expires),limit_text,mode_picker(&mode),reset,gb(total_rx),gb(total_tx),gb(month_rx),gb(month_tx),if public==1 {"checked"} else {""},if notify==1 {"checked"} else {""},if auto_renew==1 {"checked"} else {""}));
+<label>本期下行（GB）<input name="fix_month_rx" type="number" min="0" step="0.01" placeholder="现在 {}"></label><label>本期上行（GB）<input name="fix_month_tx" type="number" min="0" step="0.01" placeholder="现在 {}"></label></div></details><div class="actions"><label><input type="checkbox" name="public" value="1" {}>公开显示</label><label><input type="checkbox" name="auto_renew" value="1" {}>到期后仍在线自动续期</label><button>保存节点</button><button class="secondary" name="action" value="rotate" formnovalidate>重新生成 Token</button><label><input type="checkbox" name="confirm" value="1">确认</label><button class="danger" name="action" value="delete" formnovalidate>删除节点</button></div></form></details>{arrows}</div>"#,
+        esc(&name),if public==1 {"公开"} else {"私有"},ip_line(&conn,&id),esc(&install_command(&base,&id,&token)),esc(&uninstall_command()),esc(&id),csrf,esc(&name),esc(&country),esc(&ip),esc(&remark),price,esc(&currency),cycle_select,esc(&expires),limit_text,mode_picker(&mode),reset,gb(total_rx),gb(total_tx),gb(month_rx),gb(month_tx),if public==1 {"checked"} else {""},if auto_renew==1 {"checked"} else {""}));
     }
     if count==0 {body.push_str("<p class=\"muted\">还没有节点。</p>");}
     let add_node=format!(r#"<form method="post" action="/admin/nodes"><input type="hidden" name="csrf" value="{csrf}"><label>节点名称<input name="name" maxlength="80" required></label><div class="actions"><button>创建并显示 Agent 凭据</button></div></form>"#);
-    let grace=grace_minutes(&conn);
-    let telegram=format!(r#"<form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid"><label>Bot Token<input type="password" name="bot_token" autocomplete="off" placeholder="{}"></label><label>Chat ID<input name="chat_id" value="{}" maxlength="80"></label><label>掉线宽限（分钟）<input type="number" name="offline_grace" min="0" max="60" value="{grace}"></label></div><div class="actions"><button>保存通知设置</button><label><input type="checkbox" name="clear_token" value="1">清除 Token</label></div></form><form method="post" action="/admin/test"><input type="hidden" name="csrf" value="{csrf}"><div class="actions"><button class="secondary">发送测试通知</button></div></form>"#,
+    let telegram=format!(r#"<form method="post" action="/admin/settings"><input type="hidden" name="csrf" value="{csrf}"><div class="grid"><label>Bot Token<input type="password" name="bot_token" autocomplete="off" placeholder="{}"></label><label>Chat ID<input name="chat_id" value="{}" maxlength="80"></label></div><div class="actions"><button>保存通知设置</button><label><input type="checkbox" name="clear_token" value="1">清除 Token</label><button class="secondary" formaction="/admin/test" formnovalidate>发送测试通知</button></div></form>"#,
         if bot {"已保存，留空则不修改"} else {"123456:ABC..."},esc(&chat));
     let here=request_hosts(&headers).into_iter().next().unwrap_or_default();
-    // 常看的排前面，默认也只展开「节点」；设一次就不动的几张收在下面。
-    let page=format!("<h1>控制台</h1>{}{}{}{}{}{}{}{}{}{}{}<form method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"secondary\">退出登录</button></form>",
-        card("add-node","添加节点",open=="add-node",&add_node),
-        card("nodes","节点",open.is_empty()||open=="nodes"||open.starts_with("n-"),&body),
-        card("add-monitor","添加监控",open=="add-monitor",&monitor_form(&conn,&csrf,None,"","",60,false,&HashSet::new())),
-        card("monitors","延迟监控",open=="monitors"||open.starts_with("m-"),&monitors_section(&conn,&csrf,&open)),
+    // 卡片默认全收着；保存、排序后带 ?open= 回来，刚动过的卡片和那一行自己展开。
+    // 卡片里再分小块（新增节点 / 节点、Telegram / 资源监控），同样按 open 展开。
+    let node_list=open=="nodes"||open.starts_with("n-");
+    let monitors=format!("{}{}",monitors_section(&conn,&csrf,&open),new_row("m-new",&open,&monitor_form(&conn,&csrf,None,"","",60,false,&HashSet::new())));
+    let rules_open=open=="rules"||open.starts_with("r-");
+    let page=format!("<h1>控制台</h1>{}{}{}{}{}{}{}{}{}<form method=\"post\" action=\"/admin/logout\"><input type=\"hidden\" name=\"csrf\" value=\"{csrf}\"><button class=\"secondary\">退出登录</button></form>",
+        card("nodes","节点管理",node_list||open=="add-node",&format!("{}{}",part("add-node","新增节点",open=="add-node",&add_node),part("node-list","节点",node_list,&body))),
+        card("monitors","TCP 监控",open=="monitors"||open.starts_with("m-"),&monitors),
         card("site","站点",open=="site",&site_section(&conn,&csrf)),
         card("palette","配色",open=="palette",&palette_section(&csrf)),
         card("access","访问控制",open=="access",&access_section(&csrf,&here)),
-        card("telegram","Telegram 通知",open=="telegram",&telegram),
+        card("notify","通知",open=="telegram"||rules_open,&format!("{}{}",part("telegram","Telegram",open=="telegram",&telegram),part("rules","资源监控",rules_open,&rules_section(&conn,&csrf,&open)))),
         card("account","账号",open=="account",&account_section(&conn,&csrf,manage)),
         card("sessions","登录设备",open=="sessions",&sessions_section(&conn,&csrf,&current,manage)),
         card("backup","备份",open=="backup",&backup_section(&csrf)));
@@ -849,15 +918,16 @@ pub(super) async fn add_node(State(state):State<App>,headers:HeaderMap,Form(form
     let (Ok(id),Ok(token))=(new_secret(8),new_secret(32)) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     if conn.execute("INSERT INTO nodes(id,name,token,public,sort) VALUES (?,?,?,1,(SELECT COALESCE(MAX(sort),0)+1 FROM nodes))",params![id,name,token]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     let _=ping::attach_auto(&conn,&id);
+    let _=rules::attach_new(&conn,&id);
     CONFIG_VERSION.fetch_add(1,Ordering::Relaxed);
     let command=install_command(&public_base(&headers),&id,&token);
-    frame(&format!("<section class='card'><h1>节点已创建</h1><p>在要监控的机器上用 root 执行：</p><code class='cmd'>{}</code><details><summary class='muted'>节点 ID 和 Token</summary><p>节点 ID：<code>{}</code></p><p>Token：<code>{}</code></p></details><p><a href='/admin/'>返回管理</a></p></section>",esc(&command),esc(&id),esc(&token))).into_response()
+    frame(&format!("<section class='card'><h1>节点已创建</h1><p>在要监控的机器上用 root 执行：</p><code class='cmd'>{}</code><details><summary class='muted'>节点 ID 和 Token</summary><p>节点 ID：<code>{}</code></p><p>Token：<code>{}</code></p></details><p><a href='/admin/?open=n-{id}#n-{id}'>返回管理</a></p></section>",esc(&command),esc(&id),esc(&token))).into_response()
 }
 #[derive(Deserialize)]pub(super) struct EditNode {
     csrf:String,name:String,country:String,display_ip:String,remark:String,
     price:f64,currency:String,billing_cycle:String,expires_at:String,traffic_limit:String,traffic_mode:String,traffic_reset_day:i64,
     fix_total_rx:Option<String>,fix_total_tx:Option<String>,fix_month_rx:Option<String>,fix_month_tx:Option<String>,
-    public:Option<String>,notify:Option<String>,auto_renew:Option<String>,action:Option<String>,confirm:Option<String>,
+    public:Option<String>,auto_renew:Option<String>,action:Option<String>,confirm:Option<String>,
 }
 pub(super) async fn edit_node(Path(id):Path<String>,State(state):State<App>,headers:HeaderMap,Form(form):Form<EditNode>)->Response {
     let Ok(mut conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
@@ -879,7 +949,7 @@ pub(super) async fn edit_node(Path(id):Path<String>,State(state):State<App>,head
     }
     let Ok(tx)=conn.transaction() else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     match tx.execute("UPDATE nodes SET name=?,public=? WHERE id=?",params![name,form.public.is_some() as i32,id]) {Ok(1)=>(),Ok(_)=>return StatusCode::NOT_FOUND.into_response(),Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
-    let result=tx.execute("INSERT INTO node_config(node_id,country,display_ip,notify,remark,price,currency,billing_cycle,expires_at,traffic_limit,traffic_mode,traffic_reset_day,auto_renew) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET country=excluded.country,display_ip=excluded.display_ip,notify=excluded.notify,remark=excluded.remark,price=excluded.price,currency=excluded.currency,billing_cycle=excluded.billing_cycle,expires_at=excluded.expires_at,traffic_limit=excluded.traffic_limit,traffic_mode=excluded.traffic_mode,traffic_reset_day=excluded.traffic_reset_day,auto_renew=excluded.auto_renew",params![id,form.country.trim().to_uppercase(),form.display_ip.trim(),form.notify.is_some() as i32,form.remark.trim(),form.price,form.currency.trim(),form.billing_cycle.trim(),form.expires_at.trim(),limit.unwrap_or(0),mode,form.traffic_reset_day,form.auto_renew.is_some() as i32]);
+    let result=tx.execute("INSERT INTO node_config(node_id,country,display_ip,remark,price,currency,billing_cycle,expires_at,traffic_limit,traffic_mode,traffic_reset_day,auto_renew) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET country=excluded.country,display_ip=excluded.display_ip,remark=excluded.remark,price=excluded.price,currency=excluded.currency,billing_cycle=excluded.billing_cycle,expires_at=excluded.expires_at,traffic_limit=excluded.traffic_limit,traffic_mode=excluded.traffic_mode,traffic_reset_day=excluded.traffic_reset_day,auto_renew=excluded.auto_renew",params![id,form.country.trim().to_uppercase(),form.display_ip.trim(),form.remark.trim(),form.price,form.currency.trim(),form.billing_cycle.trim(),form.expires_at.trim(),limit.unwrap_or(0),mode,form.traffic_reset_day,form.auto_renew.is_some() as i32]);
     if result.is_err()||apply_fixes(&tx,&id,form.traffic_reset_day,fixes).is_err()||tx.commit().is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     back(&format!("n-{id}"))
 }
@@ -892,26 +962,27 @@ fn rotate_token(conn:&Connection,id:&str,base:&str)->Response {
         Ok(1)=>(),Ok(_)=>return StatusCode::NOT_FOUND.into_response(),Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
     CONFIG_VERSION.fetch_add(1,Ordering::Relaxed);
-    frame(&format!("<section class='card'><h1>Token 已更换</h1><p>旧 token 已失效，那台机器上的 agent 已被断开。在它上面重新执行一次安装命令就换上了新 token：</p><code class='cmd'>{}</code><p><a href='/admin/'>返回管理</a></p></section>",esc(&install_command(base,id,&token)))).into_response()
+    frame(&format!("<section class='card'><h1>Token 已更换</h1><p>旧 token 已失效，那台机器上的 agent 已被断开。在它上面重新执行一次安装命令就换上了新 token：</p><code class='cmd'>{}</code><p><a href='/admin/?open=n-{id}#n-{id}'>返回管理</a></p></section>",esc(&install_command(base,id,&token)))).into_response()
 }
 
 /// 删除节点，连同它的全部历史。不可恢复，所以要先勾确认。
 fn delete_node(conn:&mut Connection,id:&str,confirmed:bool)->Response {
     if !confirmed {return failure(StatusCode::BAD_REQUEST,"删除节点会一并删掉它的全部历史数据，请先勾选「确认」再点删除");}
     let Ok(tx)=conn.transaction() else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
-    let tables=["samples","latest","details","traffic","traffic_day","traffic_adjust","node_net","ping","monitor_nodes","node_config"];
+    let tables=["samples","latest","details","traffic","traffic_day","traffic_adjust","node_net","ping","monitor_nodes","node_config","alert_rule_nodes"];
     for table in tables {
         if tx.execute(&format!("DELETE FROM {table} WHERE node_id=?"),[id]).is_err() {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
-    let removed=tx.execute("DELETE FROM alert_state WHERE key IN (?,?)",[format!("node:{id}"),format!("expire:{id}")])
+    // 提醒状态的键都是「种类:节点 id」（node、expire、traffic、cpu、memory、disk、load）。id 只有十六进制字符。
+    let removed=tx.execute("DELETE FROM alert_state WHERE key LIKE '%:'||?",[id])
         .and_then(|_|tx.execute("DELETE FROM nodes WHERE id=?",[id]));
     match removed {Ok(1)=>(),Ok(_)=>return StatusCode::NOT_FOUND.into_response(),Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()}
     if tx.commit().is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     CONFIG_VERSION.fetch_add(1,Ordering::Relaxed);
     // 只删节点的话，那台机器上的 agent 会带着作废的 token 一直重连，所以顺手给出卸载命令。
-    frame(&format!("<section class='card'><h1>节点已删除</h1><p>那台机器上的 agent 还在运行，在它上面用 root 执行这一条卸载：</p><code class='cmd'>{}</code><p><a href='/admin/'>返回管理</a></p></section>",esc(&uninstall_command()))).into_response()
+    frame(&format!("<section class='card'><h1>节点已删除</h1><p>那台机器上的 agent 还在运行，在它上面用 root 执行这一条卸载：</p><code class='cmd'>{}</code><p><a href='/admin/?open=nodes#nodes'>返回管理</a></p></section>",esc(&uninstall_command()))).into_response()
 }
 
 /// 把一个监控的运行节点写成给定的集合。节点必须真实存在，且单节点不超过上限——
@@ -986,6 +1057,62 @@ pub(super) async fn edit_monitor(Path(id):Path<i64>,State(state):State<App>,head
     if tx.commit().is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     CONFIG_VERSION.fetch_add(1,Ordering::Relaxed);
     back(&format!("m-{id}"))
+}
+
+/// 资源监控表单里的数。名称 1–40 个字；掉线宽限留空按 5。
+fn rule_values(fields:&[(String,String)])->Result<rules::Rule,&'static str> {
+    let name=one(fields,"name").trim().to_string();
+    if name.is_empty()||name.chars().count()>40 {return Err("名称需要 1–40 个字");}
+    let num=|key:&str,min:i64,max:i64|rules::number(one(fields,key),min,max);
+    let (Ok(grace),Ok(expire),Ok(traffic),Ok(cpu),Ok(memory),Ok(disk),Ok(load))=(
+        num("grace",0,rules::MAX_GRACE),num("expire",1,rules::MAX_EXPIRE),num("traffic",1,100),
+        num("cpu",1,100),num("memory",1,100),num("disk",1,100),num("load",1,rules::MAX_LOAD)) else {
+        return Err("数值超出范围：掉线宽限 0–60，到期提前 1–7，流量、CPU、内存、磁盘 1–100，负载 1–1000，只能填整数");
+    };
+    Ok(rules::Rule{id:0,name,grace:grace.unwrap_or(rules::DEFAULT_GRACE),expire,traffic,cpu,memory,disk,load})
+}
+
+pub(super) async fn add_rule(State(state):State<App>,headers:HeaderMap,body:String)->Response {
+    let fields=fields(&body);
+    let Ok(conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,one(&fields,"csrf")){return StatusCode::FORBIDDEN.into_response();}
+    let rule=match rule_values(&fields) {Ok(rule)=>rule,Err(message)=>return failure(StatusCode::BAD_REQUEST,message)};
+    let total:i64=conn.query_row("SELECT COUNT(*) FROM alert_rules",[],|r|r.get(0)).unwrap_or(0);
+    if total>=rules::MAX_RULES {return failure(StatusCode::BAD_REQUEST,"资源监控数量已达上限");}
+    if conn.execute("INSERT INTO alert_rules(name,sort,grace,expire,traffic,cpu,memory,disk,load) VALUES (?,(SELECT COALESCE(MAX(sort),0)+1 FROM alert_rules),?,?,?,?,?,?,?)",
+        params![rule.name,rule.grace,rule.expire,rule.traffic,rule.cpu,rule.memory,rule.disk,rule.load]).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    // 加完自动展开这一条，机器在那里选。
+    back(&format!("r-{}",conn.last_insert_rowid()))
+}
+
+pub(super) async fn edit_rule(Path(id):Path<i64>,State(state):State<App>,headers:HeaderMap,body:String)->Response {
+    let fields=fields(&body);
+    let Ok(mut conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,one(&fields,"csrf")){return StatusCode::FORBIDDEN.into_response();}
+    let Ok(tx)=conn.transaction() else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !one(&fields,"delete").is_empty() {
+        let removed=tx.execute("DELETE FROM alert_rules WHERE id=?",[id])
+            .and_then(|_|tx.execute("DELETE FROM alert_rule_nodes WHERE rule_id=?",[id]));
+        if removed.is_err()||tx.commit().is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+        return back("rules");
+    }
+    let rule=match rule_values(&fields) {Ok(rule)=>rule,Err(message)=>return failure(StatusCode::BAD_REQUEST,message)};
+    match tx.execute("UPDATE alert_rules SET name=?,grace=?,expire=?,traffic=?,cpu=?,memory=?,disk=?,load=? WHERE id=?",
+        params![rule.name,rule.grace,rule.expire,rule.traffic,rule.cpu,rule.memory,rule.disk,rule.load,id]) {
+        Ok(1)=>(),Ok(_)=>return StatusCode::NOT_FOUND.into_response(),Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    if rules::assign(&tx,id,&many(&fields,"nodes")).is_err()||tx.commit().is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    back(&format!("r-{id}"))
+}
+
+pub(super) async fn move_rule(Path(id):Path<i64>,State(state):State<App>,headers:HeaderMap,Form(form):Form<Move>)->Response {
+    let Ok(mut conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
+    if !authorized(&headers,&conn,&form.csrf){return StatusCode::FORBIDDEN.into_response();}
+    let Some(up)=direction(&form.dir) else {return StatusCode::BAD_REQUEST.into_response()};
+    if move_row(&mut conn,"alert_rules","sort,id",&id.to_string(),up).is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
+    back_to("rules",&format!("r-{id}"))
 }
 
 pub(super) async fn save_access(State(state):State<App>,headers:HeaderMap,body:String)->Response {
@@ -1067,7 +1194,7 @@ pub(super) async fn upload_icon(State(state):State<App>,headers:HeaderMap,body:a
     back("site")
 }
 
-#[derive(Deserialize)]pub(super) struct Settings {csrf:String,bot_token:String,chat_id:String,clear_token:Option<String>,offline_grace:Option<String>}
+#[derive(Deserialize)]pub(super) struct Settings {csrf:String,bot_token:String,chat_id:String,clear_token:Option<String>}
 pub(super) async fn save_settings(State(state):State<App>,headers:HeaderMap,Form(form):Form<Settings>)->Response {
     let Ok(mut conn)=db(&state.db_path) else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     if !authorized(&headers,&conn,&form.csrf){return StatusCode::FORBIDDEN.into_response();}
@@ -1075,19 +1202,9 @@ pub(super) async fn save_settings(State(state):State<App>,headers:HeaderMap,Form
     if chat.len()>80||!chat.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'||b==b'_'||b==b'@')||token.len()>128||!token.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'||b==b'_'||b==b':') {
         return failure(StatusCode::BAD_REQUEST,"Telegram 设置格式有误");
     }
-    let grace=match form.offline_grace.as_deref().map(str::trim) {
-        None|Some("")=>None,
-        Some(value)=>match value.parse::<i64>() {
-            Ok(minutes) if (0..=MAX_GRACE_MINUTES).contains(&minutes)=>Some(minutes),
-            _=>return failure(StatusCode::BAD_REQUEST,"掉线宽限要在 0 到 60 分钟之间"),
-        },
-    };
     let Ok(tx)=conn.transaction() else{return StatusCode::INTERNAL_SERVER_ERROR.into_response()};
     if !token.is_empty()||form.clear_token.is_some(){let new=if form.clear_token.is_some(){""}else{token};if tx.execute("INSERT INTO admin_settings(key,value) VALUES('bot_token',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[new]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}}
     if tx.execute("INSERT INTO admin_settings(key,value) VALUES('chat_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[chat]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
-    if let Some(minutes)=grace {
-        if tx.execute("INSERT INTO admin_settings(key,value) VALUES('offline_grace',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[minutes.to_string()]).is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
-    }
     if tx.commit().is_err(){return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
     back("telegram")
 }
@@ -1118,17 +1235,13 @@ pub(super) fn start_checks(path:Arc<str>){
         loop {
             if let Err(e)=check_round(&path).await {eprintln!("probe checks: {e}");}
             if let Err(e)=expiry_round(&path).await {eprintln!("expiry checks: {e}");}
+            if let Err(e)=resource_round(&path).await {eprintln!("resource checks: {e}");}
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
 }
-/// 掉线宽限，默认 5 分钟（和 Komari 默认一样）。宽限内连回来的，离线、上线两条都不发。
-const DEFAULT_GRACE_MINUTES:i64=5;
-const MAX_GRACE_MINUTES:i64=60;
-fn grace_minutes(conn:&Connection)->i64 {
-    conn.query_row("SELECT value FROM admin_settings WHERE key='offline_grace'",[],|r|r.get::<_,String>(0)).ok()
-        .and_then(|v|v.parse::<i64>().ok()).map_or(DEFAULT_GRACE_MINUTES,|m|m.clamp(0,MAX_GRACE_MINUTES))
-}
+/// 掉线宽限在每台机器所属的资源监控里设，默认 5 分钟（和 Komari 默认一样）。
+/// 宽限内连回来的，离线、上线两条都不发。
 /// 通知用的"在线"：最后一次上报在宽限时间以内（至少 60 秒）。
 /// 只影响通知；后台和公开页上的在线状态照旧按 60 秒算。
 fn online_for_alerts(seen:Option<i64>,now:i64,grace_minutes:i64)->bool {
@@ -1152,20 +1265,26 @@ fn compose_alerts(went_off:&[String],came_on:&[String],total:usize)->Vec<String>
     out
 }
 async fn check_round(path:&str)->Result<(),Box<dyn Error>>{
-    let (nodes,grace):(Vec<(String,String,Option<i64>,i64)>,i64)= {
+    // 不归任何资源监控的机器照样跟踪在线状态（以后放进规则时不会补发一条旧的），只是不发通知。
+    let nodes:Vec<(String,String,Option<i64>,bool,i64)>= {
         let conn=db(path)?;
-        let grace=grace_minutes(&conn);
-        let mut stmt=conn.prepare("SELECT n.id,n.name,n.last_seen,COALESCE(c.notify,1) FROM nodes n LEFT JOIN node_config c ON n.id=c.node_id")?;
-        let rows=stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        let nodes=rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        (nodes,grace)
+        let members=rules::by_node(&conn)?;
+        let mut stmt=conn.prepare("SELECT id,name,last_seen FROM nodes")?;
+        let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?)))?;
+        let rows=rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let nodes:Vec<_>=rows.into_iter().map(|(id,name,seen)|{
+            let rule=members.get(&id);
+            let grace=rule.map_or(rules::DEFAULT_GRACE,|r|r.grace);
+            (id,name,seen,rule.is_some(),grace)
+        }).collect();
+        nodes
     };
     let total=nodes.len();
     let (mut went_off,mut came_on)=(Vec::new(),Vec::new());
-    for (id,name,seen,notify) in nodes {
+    for (id,name,seen,notify,grace) in nodes {
         let online=online_for_alerts(seen,now(),grace);
         let Some(state)=transition(path,&format!("node:{id}"),online)? else {continue};
-        if notify==0 {continue}
+        if !notify {continue}
         if state {came_on.push(name)} else {went_off.push(name)}
     }
     for msg in compose_alerts(&went_off,&came_on,total) {
@@ -1176,28 +1295,34 @@ async fn check_round(path:&str)->Result<(),Box<dyn Error>>{
     Ok(())
 }
 /// 到期提醒与自动续期。跟掉线检查一起每 30 秒跑一轮，但只在 hub 本地时间
-/// REMIND_HOUR 点之后动作。提醒同一节点同一天只发一次，发过的日子记在
-/// alert_state 里，hub 重启也不会重发；续期则是改完日期立刻通知。
+/// REMIND_HOUR 点之后动作。提前几天提醒看机器所属的资源监控，不归规则或没填就不提醒。
+/// 当天要提醒的机器合成一条发；每台同一天只发一次，发过的日子记在 alert_state 里，
+/// hub 重启也不会重发。续期则是改完日期立刻单独通知。
 async fn expiry_round(path:&str)->Result<(),Box<dyn Error>>{
-    let (today,hour,nodes)={
+    let (today,hour,nodes,members)={
         let conn=db(path)?;
         let (today,hour):(String,i64)=conn.query_row("SELECT date('now','localtime'),CAST(strftime('%H','now','localtime') AS INTEGER)",[],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        let mut stmt=conn.prepare("SELECT n.id,n.name,n.last_seen,c.notify,c.expires_at,c.billing_cycle,c.auto_renew FROM nodes n JOIN node_config c ON c.node_id=n.id WHERE c.expires_at!=''")?;
-        let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?)))?;
-        let nodes:Vec<(String,String,Option<i64>,i64,String,String,i64)>=rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        (today,hour,nodes)
+        let mut stmt=conn.prepare("SELECT n.id,n.name,n.last_seen,c.expires_at,c.billing_cycle,c.auto_renew FROM nodes n JOIN node_config c ON c.node_id=n.id WHERE c.expires_at!=''")?;
+        let rows=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,i64>(5)?)))?;
+        let nodes:Vec<(String,String,Option<i64>,String,String,i64)>=rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let members=rules::by_node(&conn)?;
+        (today,hour,nodes,members)
     };
     if hour<expiry::REMIND_HOUR {return Ok(());}
     let Some(today)=expiry::Date::parse(&today) else {return Ok(())};
-    for (id,name,seen,notify,expires,cycle,auto) in nodes {
+    let stamp=today.number();
+    let mut due:Vec<(String,String)>=Vec::new();
+    for (id,name,seen,expires,cycle,auto) in nodes {
         let Some(date)=expiry::Date::parse(&expires) else {continue};
         let online=seen.is_some_and(|v|now()-v<60);
-        match expiry::decide(date,today,&cycle,auto==1,online) {
+        let rule=members.get(&id);
+        let days=rule.and_then(|r|r.expire);
+        match expiry::decide(date,today,&cycle,auto==1,online,days.unwrap_or(expiry::REMIND_DAYS)) {
             expiry::Action::Nothing=>{}
             expiry::Action::Renew(until)=>{
                 // 以旧日期为条件更新：管理员恰好在这一刻手动改了日期，就以他改的为准。
                 let changed=db(path)?.execute("UPDATE node_config SET expires_at=? WHERE node_id=? AND expires_at=?",params![until.to_string(),id,expires])?;
-                if changed==1&&notify==1 {
+                if changed==1&&rule.is_some() {
                     let text=format!("节点 {name} 已过到期日且仍在线，已按{}自动续期至 {until}",expiry::cycle_label(&cycle));
                     if let Err(e)=send_telegram(path,&text).await {
                         if !e.contains("请先保存") {eprintln!("Telegram notification failed: {e}");}
@@ -1205,26 +1330,111 @@ async fn expiry_round(path:&str)->Result<(),Box<dyn Error>>{
                 }
             }
             expiry::Action::Remind(left)=>{
-                if notify==0 {continue}
+                if days.is_none() {continue}
                 let key=format!("expire:{id}");
-                let stamp=today.number();
                 let sent:Option<i64>=db(path)?.query_row("SELECT state FROM alert_state WHERE key=?",[&key],|r|r.get(0)).optional()?;
                 if sent==Some(stamp) {continue}
                 let renewable=auto==1&&expiry::cycle_months(&cycle).is_some();
-                let delivered=match send_telegram(path,&reminder(&name,date,left,renewable)).await {
-                    Ok(())=>true,
-                    // 没配 Telegram 就当今天已处理，免得每 30 秒空转一次。
-                    Err(e) if e.contains("请先保存")=>true,
-                    // 网络错误不记，下一轮再试。
-                    Err(e)=>{eprintln!("Telegram notification failed: {e}");false}
-                };
-                if delivered {
-                    db(path)?.execute("INSERT INTO alert_state(key,state) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state",params![key,stamp])?;
-                }
+                due.push((key,reminder(&name,date,left,renewable)));
             }
         }
     }
+    let lines:Vec<String>=due.iter().map(|(_,text)|text.clone()).collect();
+    let Some(text)=rules::bundle(&lines) else {return Ok(())};
+    let delivered=match send_telegram(path,&text).await {
+        Ok(())=>true,
+        // 没配 Telegram 就当今天已处理，免得每 30 秒空转一次。
+        Err(e) if e.contains("请先保存")=>true,
+        // 网络错误不记，下一轮再试。
+        Err(e)=>{eprintln!("Telegram notification failed: {e}");false}
+    };
+    if delivered {
+        let conn=db(path)?;
+        for (key,_) in &due {
+            conn.execute("INSERT INTO alert_state(key,state) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state",params![key,stamp])?;
+        }
+    }
     Ok(())
+}
+
+/// 资源监控的流量、CPU、内存、磁盘、负载提醒。跟掉线检查一起每 30 秒跑一轮，同一轮的提醒合成一条发。
+/// 状态先落库再发：发不出去这一条就丢了，不会每 30 秒重发刷屏（和掉线通知一样）。
+async fn resource_round(path:&str)->Result<(),Box<dyn Error>>{
+    let lines=resource_lines(&db(path)?)?;
+    let Some(text)=rules::bundle(&lines) else {return Ok(())};
+    if let Err(e)=send_telegram(path,&text).await {
+        if !e.contains("请先保存") {eprintln!("Telegram notification failed: {e}");}
+    }
+    Ok(())
+}
+
+/// 算出这一轮该发的提醒，并把新状态记下。不归规则、或规则里这一项留空的，状态悄悄清零，
+/// 以后再打开时不会冒出一条「已恢复」。
+fn resource_lines(conn:&Connection)->rusqlite::Result<Vec<String>> {
+    let members=rules::by_node(conn)?;
+    let today=local_today(conn)?;
+    let at=now();
+    let mut lines=Vec::new();
+    let mut stmt=conn.prepare("SELECT n.id,n.name,n.last_seen,COALESCE(d.cpu_cores,0),COALESCE(c.traffic_limit,0),COALESCE(c.traffic_mode,''),COALESCE(c.traffic_reset_day,1)
+        FROM nodes n LEFT JOIN details d ON d.node_id=n.id LEFT JOIN node_config c ON c.node_id=n.id ORDER BY n.sort,n.name")?;
+    let nodes=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let state=|key:&str|->rusqlite::Result<i64> {Ok(conn.query_row("SELECT state FROM alert_state WHERE key=?",[key],|r|r.get(0)).optional()?.unwrap_or(0))};
+    let store=|key:&str,value:i64|conn.execute("INSERT INTO alert_state(key,state) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state",params![key,value]);
+    for (id,name,seen,cores,limit,mode,reset) in nodes {
+        let rule=members.get(&id);
+        // 流量：每个周期到阈值一次、用完一次。状态存「周期起始日 × 10 + 已发到第几级」，进了新周期自动作废。
+        let key=format!("traffic:{id}");
+        match (rule.and_then(|r|r.traffic),today) {
+            (Some(threshold),Some(today)) if limit>0 => {
+                let start=expiry::period_start(today,reset.clamp(1,31) as u32).number();
+                let (rx,tx)=period_usage(conn,&id,reset,today)?;
+                let used=rules::metered(&mode,rx,tx);
+                let level=rules::traffic_level(used,limit,threshold);
+                let old=state(&key)?;
+                let sent=if old/10==start {old%10} else {0};
+                if i64::from(level)>sent {
+                    store(&key,start*10+i64::from(level))?;
+                    let percent=(used as f64*100.0/limit as f64).round() as i64;
+                    lines.push(if level==2 {
+                        format!("节点 {name} 本期流量已用完：{} / {} GB",gb(used),gb(limit))
+                    } else {
+                        format!("节点 {name} 本期流量 {} / {} GB（{percent}%），超过 {threshold}%",gb(used),gb(limit))
+                    });
+                }
+            }
+            (None,_) => {if state(&key)?!=0 {store(&key,0)?;}}
+            _ => {}
+        }
+        // CPU、内存、磁盘、负载：看最近 10 个采样。离线的机器数据是旧的，跳过、状态不动。
+        let online=seen.is_some_and(|v|at-v<60);
+        let mut samples=conn.prepare_cached("SELECT cpu,memory,disk,load FROM samples WHERE node_id=? AND ts>? ORDER BY ts DESC LIMIT 10")?;
+        let recent=samples.query_map(params![id,at-630],|r|Ok([r.get::<_,f64>(0)?,r.get::<_,f64>(1)?,r.get::<_,f64>(2)?,r.get::<_,f64>(3)?]))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let checks:[(&str,&str,Option<i64>,usize);4]=[
+            ("cpu","CPU",rule.and_then(|r|r.cpu),0),("memory","内存",rule.and_then(|r|r.memory),1),
+            ("disk","磁盘",rule.and_then(|r|r.disk),2),("load","负载",rule.and_then(|r|r.load),3),
+        ];
+        for (kind,label,limit,column) in checks {
+            let key=format!("{kind}:{id}");
+            let was=state(&key)?==1;
+            let Some(limit)=limit else {if was {store(&key,0)?;} continue};
+            if !online {continue}
+            // 负载换成百分比：1 分钟负载 ÷ 核数，和公开页上括号里的一样。不知道核数就不判断。
+            if column==3&&cores<=0 {continue}
+            let values:Vec<f64>=recent.iter().map(|v|if column==3 {v[3]*100.0/cores as f64} else {v[column]}).take(rules::WINDOW).collect();
+            let now_over=rules::judge(was,&values,limit as f64);
+            if now_over==was {continue}
+            store(&key,now_over as i64)?;
+            let current=values.first().map_or(0,|v|v.round() as i64);
+            lines.push(if now_over {
+                format!("节点 {name} {label}持续超过 {limit}%，现在 {current}%")
+            } else {
+                format!("节点 {name} {label}已恢复，现在 {current}%")
+            });
+        }
+    }
+    Ok(lines)
 }
 
 fn reminder(name:&str,date:expiry::Date,left:i64,renewable:bool)->String {
