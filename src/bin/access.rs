@@ -147,6 +147,8 @@ pub(super) async fn gate(State(state): State<App>, mut request: Request, next: N
     // 经过反代或 Tunnel 的请求一定带其中一个头；都没有才是容器里的健康检查。
     let local = !request.headers().contains_key("x-forwarded-for") && !request.headers().contains_key("cf-connecting-ip");
     let route = classify(&path, &admin_path());
+    // 主域名上的公开内容是凭登录才给的（设了展示页域名、或公开页关着的时候）。
+    let personal = matches!(route, Route::Public) && !on_display && !(display.is_empty() && public_enabled());
     let allowed = match route {
         Route::Admin(internal) => {
             if on_display {
@@ -187,8 +189,32 @@ pub(super) async fn gate(State(state): State<App>, mut request: Request, next: N
     if !admin && response.status().is_client_error() {
         response = StatusCode::NOT_FOUND.into_response();
     }
+    // Cloudflare 默认会在边缘缓存 .png、.js、.svg 这类文件，连 404 也缓存几分钟，缓存只按地址、不看登录。
+    // 没登录的人（或者浏览器取标签页图标时不带登录状态）先访问一次主域名的 /favicon.png，边缘就存下一份空白，
+    // 之后登录了也拿到那份空白；反过来，登录后取到的文件也会被存下来，再原样发给没登录的人。
+    // 所以 404 一律不许缓存，凭登录给出的内容只许浏览器自己缓存。
+    if response.status() == StatusCode::NOT_FOUND {
+        response.headers_mut().insert(axum::http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    } else if personal {
+        let current = response.headers().get(axum::http::header::CACHE_CONTROL).and_then(|v| v.to_str().ok());
+        if let Ok(value) = HeaderValue::from_str(&private_cache(current)) {
+            response.headers_mut().insert(axum::http::header::CACHE_CONTROL, value);
+        }
+    }
     harden(&mut response, admin);
     response
+}
+
+/// 把缓存规则改成只许浏览器自己缓存（private），共享缓存（Cloudflare）不许存。原来的期限保留。
+fn private_cache(current: Option<&str>) -> String {
+    match current {
+        Some(value) if value.contains("private") || value.contains("no-store") => value.to_string(),
+        Some(value) => {
+            let rest: Vec<&str> = value.split(',').map(str::trim).filter(|part| !part.is_empty() && *part != "public").collect();
+            if rest.is_empty() { "private".to_string() } else { format!("private, {}", rest.join(", ")) }
+        }
+        None => "private, no-cache".to_string(),
+    }
 }
 
 /// 这个请求是不是来自已登录的管理员。展示页域名上永远按访客对待，哪怕带着登录状态。
@@ -237,6 +263,15 @@ fn harden(response: &mut Response, admin: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logged_in_content_stays_out_of_shared_caches() {
+        assert_eq!(private_cache(Some("public, max-age=31536000, immutable")), "private, max-age=31536000, immutable");
+        assert_eq!(private_cache(Some("no-cache")), "private, no-cache");
+        assert_eq!(private_cache(Some("no-store")), "no-store");
+        assert_eq!(private_cache(Some("public")), "private");
+        assert_eq!(private_cache(None), "private, no-cache");
+    }
 
     #[tokio::test]
     async fn empty_404_is_a_blank_page_not_a_download() {
