@@ -114,7 +114,7 @@ fn system_info() -> SystemInfo {
         boot: fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().chars().take(64).collect() }
 }
 
-struct Counters { total: u64, idle: u64, rx: u64, tx: u64, at: Instant }
+struct Counters { total: u64, idle: u64, rx: u64, tx: u64, nics: u32, at: Instant }
 
 fn cpu_counters() -> io::Result<(u64, u64)> {
     let text = fs::read_to_string("/proc/stat")?;
@@ -164,33 +164,108 @@ fn physical(name: &str) -> bool {
     }
 }
 
-fn network_counters() -> io::Result<(u64, u64)> {
-    let text = fs::read_to_string("/proc/net/dev")?;
-    let mut rx = 0_u64; let mut tx = 0_u64;
-    for line in text.lines().skip(2) {
-        let Some((name, counters)) = line.split_once(':') else { continue };
-        let name = name.trim();
-        if name == "lo" || !physical(name) { continue; }
-        let cols: Vec<_> = counters.split_whitespace().collect();
-        if cols.len() >= 9 {
-            rx = rx.saturating_add(cols[0].parse::<u64>().unwrap_or(0));
-            tx = tx.saturating_add(cols[8].parse::<u64>().unwrap_or(0));
+/// 默认路由走的网卡（IPv4 看 /proc/net/route，IPv6 看 /proc/net/ipv6_route）。
+/// 只认生效中的路由（RTF_UP），不认拒绝路由（RTF_REJECT，IPv6 的 unreachable 默认路由就是这种，
+/// 通常挂在 lo 上），lo 本身也去掉。结果排好序、去过重。
+fn default_route_nics(v4: &str, v6: &str) -> Vec<String> {
+    const RTF_UP: u32 = 0x0001;
+    const RTF_REJECT: u32 = 0x0200;
+    let usable = |flags: &str| u32::from_str_radix(flags, 16).is_ok_and(|f| f & RTF_UP != 0 && f & RTF_REJECT == 0);
+    let mut nics = Vec::new();
+    for line in v4.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT
+        if cols.len() >= 8 && cols[1] == "00000000" && cols[7] == "00000000" && usable(cols[3]) {
+            nics.push(cols[0].to_string());
         }
     }
-    Ok((rx, tx))
+    for line in v6.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // 目的地址 前缀长度 源地址 源前缀 下一跳 metric refcnt use flags 网卡
+        if cols.len() >= 10 && cols[1] == "00" && cols[0].len() == 32 && cols[0].bytes().all(|b| b == b'0') && usable(cols[8]) {
+            nics.push(cols[9].to_string());
+        }
+    }
+    nics.retain(|nic| nic != "lo");
+    nics.sort();
+    nics.dedup();
+    nics
+}
+
+/// 从 /proc/net/dev 里挑出要统计的网卡，加总收发字节。
+///
+/// 对照过极简探针和 Komari：它们按网卡名黑名单排除，特殊机器再让用户手动指定网卡。
+/// 我们按内核事实判断，不用配置，按顺序取第一条能用的：
+/// 1. 真实网卡里走默认路由的那几张。普通 VPS、独服都在这一条；同机房内网的第二张网卡
+///    （不走默认路由）不算，免得把商家不计费的内网流量算进来。
+/// 2. 有真实网卡、但都不走默认路由：算全部真实网卡。PVE 宿主机（默认路由在网桥 vmbr0 上）、
+///    多网卡绑定（默认路由在 bond0 上）是这种，算的是物理口，不重复。
+/// 3. 一张真实网卡都没有：LXC、OpenVZ 这类容器，连主网卡 eth0 / venet0 都是虚拟的，
+///    算默认路由走的那几张。以前这里一张都不算，流量一直是 0。
+/// docker0、veth、网桥、WireGuard 这些虚拟网卡只会在第 3 条里、且正好走默认路由时才算。
+///
+/// 第三个返回值是所算网卡集合的指纹。集合一变（升级到这个版本、路由变了、容器换了网卡），
+/// 计数器的基数就不连续了；它拼进上报的 boot，hub 看到 boot 变了就重新对基线，
+/// 不会把两组网卡计数之差当成一瞬间的流量。
+fn select_counters(dev: &str, is_physical: impl Fn(&str) -> bool, routed: &[String]) -> (u64, u64, u32) {
+    let rows: Vec<(String, u64, u64)> = dev.lines().skip(2).filter_map(|line| {
+        let (name, counters) = line.split_once(':')?;
+        let name = name.trim();
+        if name.is_empty() || name == "lo" { return None; }
+        let cols: Vec<&str> = counters.split_whitespace().collect();
+        if cols.len() < 9 { return None; }
+        Some((name.to_string(), cols[0].parse().unwrap_or(0), cols[8].parse().unwrap_or(0)))
+    }).collect();
+    let real: Vec<&(String, u64, u64)> = rows.iter().filter(|row| is_physical(row.0.as_str())).collect();
+    let real_routed: Vec<&(String, u64, u64)> = real.iter().copied().filter(|row| routed.contains(&row.0)).collect();
+    let chosen: Vec<&(String, u64, u64)> = if !real_routed.is_empty() {
+        real_routed
+    } else if !real.is_empty() {
+        real
+    } else {
+        rows.iter().filter(|row| routed.contains(&row.0)).collect()
+    };
+    let mut rx = 0_u64;
+    let mut tx = 0_u64;
+    let mut names: Vec<&str> = Vec::new();
+    for row in &chosen {
+        rx = rx.saturating_add(row.1);
+        tx = tx.saturating_add(row.2);
+        names.push(row.0.as_str());
+    }
+    names.sort_unstable();
+    // FNV-1a，只用来比较"集合变没变"，不涉及安全。
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in names.join(",").bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    (rx, tx, hash)
+}
+
+fn network_counters() -> io::Result<(u64, u64, u32)> {
+    let dev = fs::read_to_string("/proc/net/dev")?;
+    let routed = default_route_nics(
+        &fs::read_to_string("/proc/net/route").unwrap_or_default(),
+        &fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default(),
+    );
+    Ok(select_counters(&dev, physical, &routed))
 }
 
 fn read_metrics(previous: &mut Option<Counters>, system: &SystemInfo) -> io::Result<Metrics> {
     let (total, idle) = cpu_counters()?;
-    let (rx, tx) = network_counters()?;
+    let (rx, tx, nics) = network_counters()?;
     let now = Instant::now();
     let (cpu, rx_rate, tx_rate) = if let Some(old) = previous {
         let delta = total.saturating_sub(old.total);
         let elapsed = now.duration_since(old.at).as_secs_f64().max(0.001);
+        // 所算的网卡变了，两次读数不能相减，这一次网速记 0。
+        let same = old.nics == nics;
         (if delta > 0 { 100.0 * (1.0 - idle.saturating_sub(old.idle) as f64 / delta as f64) } else { 0.0 },
-         rx.saturating_sub(old.rx) as f64 / elapsed, tx.saturating_sub(old.tx) as f64 / elapsed)
+         if same { rx.saturating_sub(old.rx) as f64 / elapsed } else { 0.0 },
+         if same { tx.saturating_sub(old.tx) as f64 / elapsed } else { 0.0 })
     } else { (0.0, 0.0, 0.0) };
-    *previous = Some(Counters { total, idle, rx, tx, at: now });
+    *previous = Some(Counters { total, idle, rx, tx, nics, at: now });
     let load_text = fs::read_to_string("/proc/loadavg")?;
     let mut loads = load_text.split_whitespace();
     let load = loads.next().unwrap_or("0").parse().unwrap_or(0.0);
@@ -205,7 +280,9 @@ fn read_metrics(previous: &mut Option<Counters>, system: &SystemInfo) -> io::Res
         mem_used,mem_total,swap_used,swap_total,disk_used,disk_total,rx_bytes:rx,tx_bytes:tx,
         load5,load15,os:system.os.clone(),kernel:system.kernel.clone(),arch:system.arch.clone(),
         cpu_model:system.cpu_model.clone(),cpu_cores:system.cpu_cores,
-        version:env!("CARGO_PKG_VERSION"),boot:system.boot.clone() })
+        version:env!("CARGO_PKG_VERSION"),
+        // 开机 id 后面拼上所算网卡集合的指纹（共 45 个字符，hub 那边只收十六进制和 -、最长 64）。
+        boot:format!("{}-{nics:08x}",system.boot.chars().take(36).collect::<String>()) })
 }
 
 /// 常见的公网 IPv4 判断。标准库的 is_global 还没稳定，这里自己列：去掉私有、回环、链路本地、
@@ -621,6 +698,74 @@ fe800000000000000000000000000001 02 40 20 80 eth0
         }
         assert!(public_v4("1.1.1.1".parse().unwrap()));
         assert!(public_v4("100.128.0.1".parse().unwrap()), "100.64/10 之外的 100.x 是公网");
+    }
+
+    const DEV: &str = "Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 500 5 0 0 0 0 0 0 500 5 0 0 0 0 0 0
+  eth0: 1000 10 0 0 0 0 0 0 2000 20 0 0 0 0 0 0
+  eth1: 70 7 0 0 0 0 0 0 80 8 0 0 0 0 0 0
+docker0: 300 3 0 0 0 0 0 0 400 4 0 0 0 0 0 0
+vethab12: 300 3 0 0 0 0 0 0 400 4 0 0 0 0 0 0
+ vmbr0: 900 9 0 0 0 0 0 0 900 9 0 0 0 0 0 0
+";
+    fn real(name: &str) -> bool { name == "eth0" || name == "eth1" }
+    fn routes(names: &[&str]) -> Vec<String> { names.iter().map(|n| n.to_string()).collect() }
+
+    #[test]
+    fn vps_counts_the_routed_real_nic_only() {
+        // 公网 eth0 走默认路由；eth1 是同机房内网，docker0、veth 是虚拟的，都不算
+        assert_eq!(select_counters(DEV, real, &routes(&["eth0"])).0, 1000);
+        assert_eq!(select_counters(DEV, real, &routes(&["eth0"])).1, 2000);
+        // 两张都走默认路由（双线）就都算
+        let (rx, tx, _) = select_counters(DEV, real, &routes(&["eth0", "eth1"]));
+        assert_eq!((rx, tx), (1070, 2080));
+    }
+
+    #[test]
+    fn bridged_hosts_count_all_real_nics() {
+        // PVE：默认路由在网桥 vmbr0 上，真实网卡都不走默认路由，算全部真实网卡，不算网桥
+        let (rx, tx, _) = select_counters(DEV, real, &routes(&["vmbr0"]));
+        assert_eq!((rx, tx), (1070, 2080));
+        let (rx, _, _) = select_counters(DEV, real, &[]);
+        assert_eq!(rx, 1070, "没有默认路由时也一样");
+    }
+
+    #[test]
+    fn containers_fall_back_to_the_default_route() {
+        // LXC 里 eth0 也是虚拟网卡：一张真实网卡都没有，改算默认路由走的那张
+        let (rx, tx, _) = select_counters(DEV, |_| false, &routes(&["eth0"]));
+        assert_eq!((rx, tx), (1000, 2000));
+        let (rx, tx, _) = select_counters(DEV, |_| false, &[]);
+        assert_eq!((rx, tx), (0, 0), "连默认路由都没有就没法算");
+        let (rx, _, _) = select_counters(DEV, |_| false, &routes(&["ppp9"]));
+        assert_eq!(rx, 0, "路由里的网卡在 /proc/net/dev 里没有也不出错");
+    }
+
+    #[test]
+    fn nic_set_changes_the_fingerprint() {
+        let (_, _, vps) = select_counters(DEV, real, &routes(&["eth0"]));
+        let (_, _, lxc) = select_counters(DEV, |_| false, &routes(&["eth0"]));
+        let (_, _, both) = select_counters(DEV, real, &routes(&["eth0", "eth1"]));
+        assert_eq!(vps, lxc, "算的是同一张网卡，指纹一样");
+        assert_ne!(vps, both, "网卡集合变了，指纹跟着变，hub 会重新对基线");
+    }
+
+    #[test]
+    fn reads_default_routes() {
+        let v4 = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT
+eth0\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0
+eth0\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0
+eth2\t00000000\t0101A8C0\t0002\t0\t0\t0\t00000000\t0\t0\t0
+";
+        let v6 = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 eth1
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00000201 eth3
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0
+";
+        // eth2 的路由没有 UP，eth3 是拒绝路由，lo 不算
+        assert_eq!(default_route_nics(v4, v6), routes(&["eth0", "eth1"]));
+        assert!(default_route_nics("", "").is_empty(), "读不到路由表时是空的");
     }
 
     #[test]
