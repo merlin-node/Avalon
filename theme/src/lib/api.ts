@@ -21,6 +21,9 @@ export type Metrics = {
   procs: number
 }
 
+/** One disk: its mount point, used and total bytes. The system disk comes first. */
+export type Disk = { mount: string; used: number; total: number }
+
 export type Node = {
   id: number
   name: string
@@ -40,6 +43,8 @@ export type Node = {
   mem_total: number
   swap_total: number
   disk_total: number
+  /** 只有挂了数据盘的机器才有，系统盘排第一；访客拿到的挂载盘路径是空的。 */
+  disks?: Disk[]
   agent_version: string
   price: number
   /** Adapter metadata: distinguish an unconfigured plan from a genuinely free one. */
@@ -84,6 +89,14 @@ type ProbeNode = {
   month_rx: number; month_tx: number
   country?: string; price?: number; currency?: string; billing_cycle?: string; expires_at?: string
   traffic_limit?: number; traffic_mode?: string; traffic_reset_day?: number
+  disks?: Disk[]
+}
+
+/** 分盘只在多盘时有意义。有一项不对就整个不用，退回只显示总和的那一行。 */
+function diskList(disks: unknown): Disk[] {
+  if (!Array.isArray(disks) || disks.length < 2) return []
+  const number = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0
+  return disks.every((d) => d && typeof d.mount === "string" && number(d.used) && number(d.total)) ? (disks as Disk[]) : []
 }
 
 const originalIds = new Map<number, string>()
@@ -107,7 +120,7 @@ export function adaptNode(n: ProbeNode, sort = 0): Node {
     last_seen: n.last_seen ?? 0, metrics: n.online ? m : null,
     os: n.os, kernel: n.kernel, arch: n.arch, virt: "", cpu_name: n.cpu_model,
     cpu_cores: n.cpu_cores, mem_total: n.mem_total, swap_total: n.swap_total,
-    disk_total: n.disk_total, agent_version: n.agent_version ?? "", price: n.price ?? 0,
+    disk_total: n.disk_total, disks: diskList(n.disks), agent_version: n.agent_version ?? "", price: n.price ?? 0,
     billing_known: Boolean(n.billing_cycle || n.currency || n.price || n.expires_at), currency: n.currency ?? "",
     billing_cycle: n.billing_cycle ?? "", expires_at: n.expires_at || null,
     traffic_limit: n.traffic_limit ?? 0, traffic_limit_known: Boolean(n.traffic_limit), traffic_mode: n.traffic_mode ?? "",

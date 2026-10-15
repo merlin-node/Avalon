@@ -44,6 +44,7 @@ struct Metrics {
     mem_total: u64,
     swap_used: u64,
     swap_total: u64,
+    /// 所有真实磁盘之和。只有一块盘时就是系统盘，和以前一样。
     disk_used: u64,
     disk_total: u64,
     rx_bytes: u64,
@@ -60,6 +61,23 @@ struct Metrics {
     /// 本次开机的 ID。hub 靠它区分「计数器涨了」和「机器重启过、计数器从零开始」，
     /// agent 自己不存任何状态。
     boot: String,
+    /// 下面三项只在有挂载盘时才发，单盘机器的上报和以前一字不差。
+    /// 每块盘一项，系统盘排第一。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    disks: Vec<Disk>,
+    /// 系统盘、最满那块挂载盘的已用百分比，给磁盘提醒用：总和会被大盘摊薄。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_root: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_mount: Option<f64>,
+}
+
+/// 一块盘：挂载点、已用、总量（字节）。
+#[derive(Serialize, Debug, PartialEq)]
+struct Disk {
+    mount: String,
+    used: u64,
+    total: u64,
 }
 
 /// hub 下发的一个监控任务。
@@ -142,14 +160,118 @@ fn memory_usage() -> io::Result<(u64,u64,u64,u64)> {
         swap_total.saturating_sub(swap_free).saturating_mul(1024), swap_total.saturating_mul(1024)))
 }
 
-fn disk_usage() -> io::Result<(u64,u64)> {
+/// 一个挂载点的 (已用, 总量)。已用 = 总块数 − 普通用户可用块数，ext4 给 root 预留的那部分算已用：
+/// 100% 就是普通程序写不进去了。系统盘一直是这么算的，挂载盘跟着用同一个口径。
+fn statvfs_bytes(path: &str) -> io::Result<(u64,u64)> {
     use std::ffi::CString;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    let path = CString::new("/").unwrap();
+    let path = CString::new(path).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 { return Err(io::Error::last_os_error()); }
     let stat = unsafe { stat.assume_init() };
     Ok((stat.f_blocks.saturating_sub(stat.f_bavail).saturating_mul(stat.f_frsize),
         stat.f_blocks.saturating_mul(stat.f_frsize)))
+}
+
+/// 算进硬盘用量的文件系统。用白名单：tmpfs、overlay（Docker）、squashfs（snap）、iso9660（cloud-init
+/// 配置盘）、ecryptfs、nfs、fuse 和 proc/sysfs/cgroup 这些虚拟的种类太多，黑名单追不完。
+/// 系统盘不受这个限制，什么类型都算（OpenVZ 的 simfs、LXC 的根也照算）。
+const REAL_FS: &[&str] = &["ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "reiserfs", "bcachefs"];
+/// 系统盘之外最多算几块，上报的路径最长多少字节。和 hub 的校验一致。
+const MAX_MOUNTS: usize = 7;
+const MAX_MOUNT_PATH: usize = 64;
+
+/// /proc/self/mountinfo 里的一行。
+struct Mount { dev: u64, point: String, fstype: String, source: String }
+
+/// 和 glibc / musl 的 makedev 一样的编码，st_dev 就是这么拼出来的。
+fn makedev(major: u64, minor: u64) -> u64 {
+    ((major & 0xffff_f000) << 32) | ((major & 0xfff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0xff)
+}
+
+/// 挂载表里空格、制表符、换行和反斜杠写成 \040 这样的三位八进制。
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes.get(i + 1..i + 4).filter(|d| bytes[i] == b'\\' && d.iter().all(|b| (b'0'..=b'7').contains(b)));
+        match octal {
+            Some(d) => { out.push(((d[0] - b'0') << 6) | ((d[1] - b'0') << 3) | (d[2] - b'0')); i += 4; }
+            None => { out.push(bytes[i]); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 格式：编号 父编号 主:次 根 挂载点 选项 [可选字段…] - 类型 来源 超级块选项
+fn parse_mountinfo(text: &str) -> Vec<Mount> {
+    text.lines().filter_map(|line| {
+        let (head, tail) = line.split_once(" - ")?;
+        let head: Vec<&str> = head.split(' ').collect();
+        let mut tail = tail.split(' ');
+        let (major, minor) = head.get(2)?.split_once(':')?;
+        Some(Mount {
+            dev: makedev(major.parse().ok()?, minor.parse().ok()?),
+            point: unescape(head.get(4)?),
+            fstype: tail.next()?.to_string(),
+            source: unescape(tail.next()?),
+        })
+    }).collect()
+}
+
+/// 从挂载表里挑出要算的盘，系统盘排第一。`probe` 返回挂载点的 (st_dev, 已用, 总量)，读不到是 None。
+///
+/// 去重靠两把钥匙，任一重复就跳过：
+/// - 来源设备名：btrfs 的几个子卷 st_dev 各不相同，却是同一块盘、共用空间；
+/// - 挂载点的 st_dev：bind mount、Docker volume，以及根被写成 /dev/root 而别处写 /dev/sda1 的情况。
+///
+/// 挂载点的 st_dev 要和挂载表里这一行的设备号对得上，对不上说明这个路径上面又盖了别的东西
+/// （systemd 沙箱会把空目录盖在 /home、/tmp 上），statvfs 读到的是盖上去的那层，跳过。
+///
+/// ZFS 按池名去重：同一个池里的 dataset 共用剩余空间，每个都算一遍会把剩余空间加好几次。
+/// 只算池里第一个挂上的 dataset，其他 dataset 的已用没计入，ZFS 机器的已用会偏小。
+fn pick_disks(mounts: &[Mount], probe: impl Fn(&str) -> Option<(u64, u64, u64)>) -> Option<Vec<Disk>> {
+    let (root_dev, used, total) = probe("/")?;
+    let mut disks = vec![Disk { mount: "/".into(), used, total }];
+    let mut seen_dev = std::collections::HashSet::from([root_dev]);
+    let mut seen_source = std::collections::HashSet::new();
+    let key = |m: &Mount| if m.fstype == "zfs" { m.source.split('/').next().unwrap_or("").to_string() } else { m.source.clone() };
+    // 根上可能叠着好几层（容器里常见），最上面那层才是现在的根。
+    if let Some(root) = mounts.iter().rev().find(|m| m.point == "/") { seen_source.insert(key(root)); }
+    for m in mounts {
+        if disks.len() > MAX_MOUNTS { break; }
+        if m.point == "/" || !REAL_FS.contains(&m.fstype.as_str()) || seen_source.contains(&key(m)) { continue; }
+        let Some((dev, used, total)) = probe(&m.point) else { continue };
+        if dev != m.dev || total == 0 || !seen_dev.insert(dev) { continue; }
+        seen_source.insert(key(m));
+        disks.push(Disk { mount: shown_path(&m.point), used, total });
+    }
+    Some(disks)
+}
+
+/// 上报用的路径：控制字符换成 ?，超长的截断（hub 只收 64 字节以内）。
+fn shown_path(point: &str) -> String {
+    let mut out = String::new();
+    for c in point.chars().map(|c| if c.is_control() { '?' } else { c }) {
+        if out.len() + c.len_utf8() > MAX_MOUNT_PATH { break; }
+        out.push(c);
+    }
+    out
+}
+
+/// 每块真实磁盘的用量，系统盘排第一。系统盘读不到就整次报错，和以前一样；挂载盘读不到的跳过。
+fn disk_usage() -> io::Result<Vec<Disk>> {
+    use std::os::unix::fs::MetadataExt;
+    let mounts = parse_mountinfo(&fs::read_to_string("/proc/self/mountinfo").unwrap_or_default());
+    let root = statvfs_bytes("/")?;
+    let root_dev = fs::metadata("/")?.dev();
+    let probe = |path: &str| -> Option<(u64, u64, u64)> {
+        if path == "/" { return Some((root_dev, root.0, root.1)); }
+        let dev = fs::metadata(path).ok()?.dev();
+        let (used, total) = statvfs_bytes(path).ok()?;
+        Some((dev, used, total))
+    };
+    Ok(pick_disks(&mounts, probe).unwrap_or_else(|| vec![Disk { mount: "/".into(), used: root.0, total: root.1 }]))
 }
 
 /// 只统计真实网卡。判据是 /sys/class/net/<名字> 指向哪里：docker0、veth*、
@@ -273,8 +395,16 @@ fn read_metrics(previous: &mut Option<Counters>, system: &SystemInfo) -> io::Res
     let load15 = loads.next().unwrap_or("0").parse().unwrap_or(0.0);
     let uptime = fs::read_to_string("/proc/uptime")?.split_whitespace().next().unwrap_or("0").parse::<f64>().unwrap_or(0.0) as u64;
     let (mem_used,mem_total,swap_used,swap_total) = memory_usage()?;
-    let (disk_used,disk_total) = disk_usage()?;
     let percent = |used:u64,total:u64| if total>0 { (100.0*used as f64/total as f64).clamp(0.0,100.0) } else { 0.0 };
+    let disks = disk_usage()?;
+    let disk_used = disks.iter().fold(0_u64, |sum, d| sum.saturating_add(d.used));
+    let disk_total = disks.iter().fold(0_u64, |sum, d| sum.saturating_add(d.total));
+    // 只有系统盘时这三项都不发：总和就是系统盘，hub 照旧处理。
+    let (disks, disk_root, disk_mount) = if disks.len() > 1 {
+        let root = percent(disks[0].used, disks[0].total);
+        let mount = disks[1..].iter().map(|d| percent(d.used, d.total)).fold(0.0, f64::max);
+        (disks, Some(root), Some(mount))
+    } else { (Vec::new(), None, None) };
     Ok(Metrics { cpu: cpu.clamp(0.0, 100.0), memory: percent(mem_used,mem_total),
         disk: percent(disk_used,disk_total), rx: rx_rate, tx: tx_rate, load, uptime,
         mem_used,mem_total,swap_used,swap_total,disk_used,disk_total,rx_bytes:rx,tx_bytes:tx,
@@ -282,7 +412,8 @@ fn read_metrics(previous: &mut Option<Counters>, system: &SystemInfo) -> io::Res
         cpu_model:system.cpu_model.clone(),cpu_cores:system.cpu_cores,
         version:env!("CARGO_PKG_VERSION"),
         // 开机 id 后面拼上所算网卡集合的指纹（共 45 个字符，hub 那边只收十六进制和 -、最长 64）。
-        boot:format!("{}-{nics:08x}",system.boot.chars().take(36).collect::<String>()) })
+        boot:format!("{}-{nics:08x}",system.boot.chars().take(36).collect::<String>()),
+        disks, disk_root, disk_mount })
 }
 
 /// 常见的公网 IPv4 判断。标准库的 is_global 还没稳定，这里自己列：去掉私有、回环、链路本地、
@@ -673,6 +804,90 @@ mod tests {
         assert!((0.0..=100.0).contains(&m.memory));
         assert!((0.0..=100.0).contains(&m.disk));
         assert!(m.load.is_finite());
+    }
+
+    /// 按 hostbrrDE 的挂载表造的：系统盘 + 数据盘，外加 Docker、cloud-init 配置盘和一个 bind mount。
+    const HOSTBRR: &str = "22 28 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw
+23 28 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw
+24 28 0:5 / /dev rw,nosuid,relatime shared:2 - devtmpfs udev rw,size=1000k,nr_inodes=250000,mode=755
+28 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,discard,errors=remount-ro
+30 28 0:26 / /run rw,nosuid,nodev,noexec,relatime shared:5 - tmpfs tmpfs rw,size=200000k,mode=755
+40 28 254:1 / /data rw,relatime shared:20 - ext4 /dev/vda1 rw
+41 28 11:0 / /media/cidata ro,relatime shared:21 - iso9660 /dev/sdb ro
+50 28 0:40 / /var/lib/docker/overlay2/abc/merged rw,relatime - overlay overlay rw,lowerdir=/x,upperdir=/y,workdir=/z
+51 28 254:1 /backup /srv/backup rw,relatime shared:20 - ext4 /dev/vda1 rw";
+
+    fn probe_from<'a>(table: &'a [(&'a str, (u64, u64, u64))]) -> impl Fn(&str) -> Option<(u64, u64, u64)> + 'a {
+        move |path: &str| table.iter().find(|(p, _)| *p == path).map(|(_, v)| *v)
+    }
+
+    fn mounts_of(disks: &[Disk]) -> Vec<&str> { disks.iter().map(|d| d.mount.as_str()).collect() }
+
+    #[test]
+    fn counts_the_data_disk_once_and_skips_virtual_ones() {
+        let table = [("/", (makedev(8, 1), 2_800_000_000, 20_960_000_000)), ("/data", (makedev(254, 1), 2_200_000, 2_166_000_000_000)),
+            ("/srv/backup", (makedev(254, 1), 2_200_000, 2_166_000_000_000)), ("/media/cidata", (makedev(11, 0), 376_832, 376_832))];
+        let disks = pick_disks(&parse_mountinfo(HOSTBRR), probe_from(&table)).unwrap();
+        assert_eq!(mounts_of(&disks), ["/", "/data"], "iso9660、overlay、tmpfs 不算，bind mount 只算一次");
+        assert_eq!(disks[1], Disk { mount: "/data".into(), used: 2_200_000, total: 2_166_000_000_000 });
+    }
+
+    #[test]
+    fn single_disk_machines_report_just_the_root() {
+        let only_root: String = HOSTBRR.lines().filter(|l| !l.contains("/dev/vda1")).collect::<Vec<_>>().join("\n");
+        let table = [("/", (makedev(8, 1), 7, 9))];
+        let disks = pick_disks(&parse_mountinfo(&only_root), probe_from(&table)).unwrap();
+        assert_eq!(disks, [Disk { mount: "/".into(), used: 7, total: 9 }]);
+        assert!(pick_disks(&parse_mountinfo(HOSTBRR), probe_from(&[])).is_none(), "系统盘读不到要报错，不能悄悄报 0");
+    }
+
+    #[test]
+    fn skips_mounts_hidden_or_unreadable_under_the_sandbox() {
+        let text = format!("{HOSTBRR}\n60 28 8:33 / /home rw - ext4 /dev/sdc1 rw\n61 60 0:50 / /home ro - tmpfs tmpfs ro\n62 28 8:49 / /mnt/x rw - ext4 /dev/sdd1 rw");
+        // /home 上被盖了一层空目录，statvfs 读到的是那层；/mnt/x 读不到。
+        let table = [("/", (makedev(8, 1), 1, 2)), ("/data", (makedev(254, 1), 1, 2)), ("/home", (makedev(0, 50), 0, 4096))];
+        let disks = pick_disks(&parse_mountinfo(&text), probe_from(&table)).unwrap();
+        assert_eq!(mounts_of(&disks), ["/", "/data"]);
+    }
+
+    #[test]
+    fn the_same_filesystem_under_another_name_counts_once() {
+        // 根写成 /dev/root，别处又挂了一次 /dev/sda1：设备名不同，st_dev 相同。
+        let alias = "1 0 8:1 / / rw - ext4 /dev/root rw\n2 1 8:1 /srv /mnt/srv rw - ext4 /dev/sda1 rw";
+        let table = [("/", (makedev(8, 1), 1, 2)), ("/mnt/srv", (makedev(8, 1), 1, 2))];
+        assert_eq!(mounts_of(&pick_disks(&parse_mountinfo(alias), probe_from(&table)).unwrap()), ["/"]);
+        // btrfs 子卷：st_dev 不同，设备名相同。
+        let btrfs = "1 0 0:30 /@ / rw - btrfs /dev/sda2 rw\n2 1 0:31 /@home /home rw - btrfs /dev/sda2 rw";
+        let table = [("/", (makedev(0, 30), 1, 2)), ("/home", (makedev(0, 31), 1, 2))];
+        assert_eq!(mounts_of(&pick_disks(&parse_mountinfo(btrfs), probe_from(&table)).unwrap()), ["/"]);
+        // ZFS：同一个池只算一次，另一个池照算。
+        let zfs = "1 0 0:40 / / rw - zfs rpool/ROOT/pve-1 rw\n2 1 0:41 / /rpool/data rw - zfs rpool/data rw\n3 1 0:42 / /tank rw - zfs tank rw\n4 3 0:43 / /tank/media rw - zfs tank/media rw";
+        let table = [("/", (makedev(0, 40), 1, 2)), ("/rpool/data", (makedev(0, 41), 1, 2)), ("/tank", (makedev(0, 42), 1, 2)), ("/tank/media", (makedev(0, 43), 1, 2))];
+        assert_eq!(mounts_of(&pick_disks(&parse_mountinfo(zfs), probe_from(&table)).unwrap()), ["/", "/tank"]);
+    }
+
+    #[test]
+    fn mount_paths_are_decoded_and_kept_short() {
+        let text = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:17 / /mnt/my\\040disk rw - xfs /dev/sdb1 rw";
+        let table = [("/", (makedev(8, 1), 1, 2)), ("/mnt/my disk", (makedev(8, 17), 1, 2))];
+        assert_eq!(mounts_of(&pick_disks(&parse_mountinfo(text), probe_from(&table)).unwrap()), ["/", "/mnt/my disk"]);
+        assert_eq!(unescape("a\\134b\\011c"), "a\\b\tc");
+        assert_eq!(shown_path("/a\nb"), "/a?b");
+        assert_eq!(shown_path(&format!("/{}", "x".repeat(100))).len(), MAX_MOUNT_PATH);
+        assert_eq!(shown_path(&format!("/x{}", "盘".repeat(30))).len(), 62, "截在字符边界上");
+        assert_eq!((makedev(8, 1), makedev(254, 1)), (0x801, 0xfe01));
+    }
+
+    #[test]
+    fn caps_the_number_of_disks() {
+        let mut text = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw");
+        let mut table = vec![("/".to_string(), (makedev(8, 1), 1, 2))];
+        for i in 0..12_u64 {
+            text.push_str(&format!("\n{} 1 9:{i} / /d{i} rw - ext4 /dev/md{i} rw", i + 2));
+            table.push((format!("/d{i}"), (makedev(9, i), 1, 2)));
+        }
+        let probe = |path: &str| table.iter().find(|(p, _)| p == path).map(|(_, v)| *v);
+        assert_eq!(pick_disks(&parse_mountinfo(&text), probe).unwrap().len(), MAX_MOUNTS + 1);
     }
 
     #[test]

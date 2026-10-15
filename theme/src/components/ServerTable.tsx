@@ -180,7 +180,17 @@ function Details({ node, chart }: { node: Node; chart: boolean }) {
         <Line label="交换">
           {node.swap_total > 0 ? (m ? usage(m.swap_used, m.swap_total) : bytes(node.swap_total)) : "未启用"}
         </Line>
-        <Line label="硬盘">{m ? usage(m.disk_used, m.disk_total) : bytes(node.disk_total)}</Line>
+        {/* 多盘机器分开列，系统盘在前；挂载盘登录后显示路径，访客看到的是编号。 */}
+        <Line label="硬盘">
+          {node.disks && node.disks.length > 1
+            ? node.disks.map((d, i) => (
+                <span key={i} className="block">
+                  <span className="text-muted-foreground">{d.mount === "/" ? "系统盘" : d.mount || `挂载盘 ${i}`}</span>{" "}
+                  {m ? usage(d.used, d.total) : bytes(d.total)}
+                </span>
+              ))
+            : m ? usage(m.disk_used, m.disk_total) : bytes(node.disk_total)}
+        </Line>
 
         {/* The 1-minute figure over the core count: 100% is every core busy, above it
             work is queueing, so it is not capped. Waiting on the disk counts too, which

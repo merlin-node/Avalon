@@ -992,8 +992,8 @@ fn delete_node(conn:&mut Connection,id:&str,confirmed:bool)->Response {
         }
     }
     // 提醒状态的键都是「种类:节点 id」，逐个写全，不用 LIKE 通配。
-    let keys=["node","expire","traffic","cpu","memory","disk","load"].map(|kind|format!("{kind}:{id}"));
-    let removed=tx.execute("DELETE FROM alert_state WHERE key IN (?,?,?,?,?,?,?)",rusqlite::params_from_iter(keys.iter()))
+    let keys=["node","expire","traffic","cpu","memory","disk","mount","load"].map(|kind|format!("{kind}:{id}"));
+    let removed=tx.execute("DELETE FROM alert_state WHERE key IN (?,?,?,?,?,?,?,?)",rusqlite::params_from_iter(keys.iter()))
         .and_then(|_|tx.execute("DELETE FROM nodes WHERE id=?",[id]));
     match removed {Ok(1)=>(),Ok(_)=>return StatusCode::NOT_FOUND.into_response(),Err(_)=>return StatusCode::INTERNAL_SERVER_ERROR.into_response()}
     if tx.commit().is_err() {return StatusCode::INTERNAL_SERVER_ERROR.into_response();}
@@ -1451,13 +1451,18 @@ fn resource_lines(conn:&Connection)->rusqlite::Result<(Vec<String>,Vec<(String,i
             _ => {}
         }
         // CPU、内存、磁盘、负载：看最近 10 个采样。离线的机器数据是旧的，跳过、状态不动。
+        // 磁盘分系统盘和挂载盘两路，共用规则里的「磁盘」阈值：总和会被大盘摊薄，系统盘满了也看不出来。
+        // 系统盘：旧被控和单盘机器不报 disk_root，它们的 disk 本来就是系统盘。挂载盘：只有多盘机器有。
         let online=seen.is_some_and(|v|at-v<60);
-        let mut samples=conn.prepare_cached("SELECT cpu,memory,disk,load FROM samples WHERE node_id=? AND ts>? ORDER BY ts DESC LIMIT 10")?;
-        let recent=samples.query_map(params![id,at-630],|r|Ok([r.get::<_,f64>(0)?,r.get::<_,f64>(1)?,r.get::<_,f64>(2)?,r.get::<_,f64>(3)?]))?
+        let mut samples=conn.prepare_cached("SELECT cpu,memory,COALESCE(disk_root,disk),load,disk_mount FROM samples WHERE node_id=? AND ts>? ORDER BY ts DESC LIMIT 10")?;
+        let rows=samples.query_map(params![id,at-630],|r|Ok(([r.get::<_,f64>(0)?,r.get::<_,f64>(1)?,r.get::<_,f64>(2)?,r.get::<_,f64>(3)?],r.get::<_,Option<f64>>(4)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let checks:[(&str,&str,Option<i64>,usize);4]=[
+        let recent:Vec<[f64;4]>=rows.iter().map(|row|row.0).collect();
+        let mounts:Vec<f64>=rows.iter().filter_map(|row|row.1).collect();
+        let checks:[(&str,&str,Option<i64>,usize);5]=[
             ("cpu","CPU",rule.and_then(|r|r.cpu),0),("memory","内存",rule.and_then(|r|r.memory),1),
-            ("disk","磁盘",rule.and_then(|r|r.disk),2),("load","负载",rule.and_then(|r|r.load),3),
+            ("disk","系统盘",rule.and_then(|r|r.disk),2),("mount","挂载盘",rule.and_then(|r|r.disk),4),
+            ("load","负载",rule.and_then(|r|r.load),3),
         ];
         for (kind,label,limit,column) in checks {
             let key=format!("{kind}:{id}");
@@ -1466,11 +1471,15 @@ fn resource_lines(conn:&Connection)->rusqlite::Result<(Vec<String>,Vec<(String,i
             if !online {continue}
             // 负载换成百分比：1 分钟负载 ÷ 核数，和公开页上括号里的一样。不知道核数就不判断。
             if column==3&&cores<=0 {continue}
-            let values:Vec<f64>=recent.iter().map(|v|if column==3 {v[3]*100.0/cores as f64} else {v[column]}).take(rules::WINDOW).collect();
+            let values:Vec<f64>=if column==4 {mounts.iter().copied().take(rules::WINDOW).collect()} else {
+                recent.iter().map(|v|if column==3 {v[3]*100.0/cores as f64} else {v[column]}).take(rules::WINDOW).collect()
+            };
             let now_over=rules::judge(was,&values,limit as f64);
             if now_over==was {continue}
             pending.push((key.clone(),now_over as i64));
             let current=values.first().map_or(0,|v|v.round() as i64);
+            // 挂载盘写出是哪一块（最满的那块）。Telegram 只发给自己，写真实路径没问题。
+            let label=if column==4 {fullest_mount(conn,&id)?.map_or_else(||label.to_string(),|path|format!("{label} {path}"))} else {label.to_string()};
             lines.push(if now_over {
                 format!("节点 {name} {label}持续在 {limit}% 以上，现在 {current}%")
             } else {
@@ -1479,6 +1488,18 @@ fn resource_lines(conn:&Connection)->rusqlite::Result<(Vec<String>,Vec<(String,i
         }
     }
     Ok((lines,pending))
+}
+
+/// 这台机器现在最满的那块挂载盘的路径，读的是最新一次上报存下的分盘。没有就是 None。
+fn fullest_mount(conn:&Connection,id:&str)->rusqlite::Result<Option<String>> {
+    let text:Option<String>=conn.query_row("SELECT disks FROM details WHERE node_id=?",[id],|r|r.get(0)).optional()?;
+    let Some(disks)=text.and_then(|text|serde_json::from_str::<Vec<serde_json::Value>>(&text).ok()) else {return Ok(None)};
+    let ratio=|d:&serde_json::Value|{
+        let total=d["total"].as_u64().unwrap_or(0);
+        if total==0 {0.0} else {d["used"].as_u64().unwrap_or(0) as f64/total as f64}
+    };
+    Ok(disks.iter().skip(1).max_by(|a,b|ratio(*a).total_cmp(&ratio(*b)))
+        .and_then(|d|d["mount"].as_str()).filter(|path|!path.is_empty()).map(str::to_string))
 }
 
 fn reminder(name:&str,date:expiry::Date,left:i64,renewable:bool)->String {
@@ -1783,5 +1804,33 @@ mod tests {
         assert_eq!(parse_target("1.1.1.1:0"),None,"端口 0");
         assert_eq!(parse_target("2606:4700::1111:443"),None,"未加方括号的 IPv6");
         assert_eq!(parse_target("../etc:80"),None);
+    }
+
+    /// 总和只有 0.1% 时系统盘满了照样报；挂载盘单独一路，消息里写是哪一块。
+    #[test]
+    fn disk_alerts_watch_the_system_disk_and_mounts_separately() {
+        let path=std::env::temp_dir().join(format!("avalon-disk-alert-{}.db",std::process::id())).to_str().unwrap().to_string();
+        for suffix in ["","-wal","-shm"] {let _=std::fs::remove_file(format!("{path}{suffix}"));}
+        init_db(&path).unwrap();
+        let conn=db(&path).unwrap();
+        let at=now();
+        conn.execute("INSERT INTO nodes(id,name,token,public,last_seen) VALUES('0123456789abcdef','DE','t',1,?)",[at]).unwrap();
+        conn.execute("UPDATE alert_rules SET disk=90",[]).unwrap();
+        conn.execute("INSERT INTO alert_rule_nodes(node_id,rule_id) SELECT '0123456789abcdef',id FROM alert_rules",[]).unwrap();
+        let report=|root:f64,mount:f64|serde_json::from_str::<Metrics>(&format!(r#"{{"cpu":1,"memory":2,"disk":0.1,"rx":0,"tx":0,"load":0,"uptime":9,
+            "mem_total":100,"disk_used":3,"disk_total":30,"disk_root":{root},"disk_mount":{mount},
+            "disks":[{{"mount":"/","used":19,"total":20}},{{"mount":"/srv","used":0,"total":2}},{{"mount":"/data","used":19,"total":20}}]}}"#)).unwrap();
+        let fill=|root:f64,mount:f64|{
+            let mut last=0;
+            for i in 0..10 {store_metrics(&conn,"0123456789abcdef",at-540+i*60,&report(root,mount),&mut last).unwrap();}
+        };
+        fill(95.0,50.0);
+        let (lines,pending)=resource_lines(&conn).unwrap();
+        assert_eq!(lines,["节点 DE 系统盘持续在 90% 以上，现在 95%"]);
+        for (key,value) in &pending {write_state(&conn,key,*value).unwrap();}
+        fill(95.0,95.0);
+        let (lines,_)=resource_lines(&conn).unwrap();
+        assert_eq!(lines,["节点 DE 挂载盘 /data 持续在 90% 以上，现在 95%"],"系统盘已经报过不再重复；挂载盘写最满的那块");
+        for suffix in ["","-wal","-shm"] {let _=std::fs::remove_file(format!("{path}{suffix}"));}
     }
 }

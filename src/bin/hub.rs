@@ -58,7 +58,21 @@ struct Metrics {
     #[serde(default)] version: String,
     /// /proc/sys/kernel/random/boot_id。每次开机都会变，用来判断流量计数器是不是同一次开机的。
     #[serde(default)] boot: String,
+    /// 下面三项只有挂了数据盘的机器才报，旧被控和单盘机器都没有。disk_used / disk_total / disk 是所有盘之和。
+    /// 每块盘一项，系统盘排第一。
+    #[serde(default)] disks: Vec<Disk>,
+    /// 系统盘、最满那块挂载盘的已用百分比，磁盘提醒分开判断用。
+    #[serde(default)] disk_root: Option<f64>,
+    #[serde(default)] disk_mount: Option<f64>,
 }
+
+/// 一块盘。存进 details.disks（JSON），也原样放进公开接口；访客拿到的版本里挂载盘的路径是空的。
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+struct Disk { mount: String, used: u64, total: u64 }
+
+/// 和被控一致：系统盘之外最多 7 块，路径最长 64 字节。
+const MAX_DISKS: usize = 8;
+const MAX_MOUNT_PATH: usize = 64;
 
 /// agent 上行帧。`t` 区分类型，未知类型直接丢弃而不是断连，方便以后加字段。
 #[derive(Deserialize)]
@@ -81,6 +95,8 @@ struct Node {
     rx_total: u64, tx_total: u64, day_rx: u64, day_tx: u64, month_rx: u64, month_tx: u64,
     country: String, price: f64, currency: String, billing_cycle: String, expires_at: String,
     traffic_limit: u64, traffic_mode: String, traffic_reset_day: i64,
+    /// 只有多盘机器才有内容。
+    disks: Vec<Disk>,
 }
 
 #[derive(Serialize)]
@@ -161,7 +177,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("traffic_reset_day", "INTEGER NOT NULL DEFAULT 1"),
         ("auto_renew", "INTEGER NOT NULL DEFAULT 1"),
     ])?;
-    add_columns(conn, "details", &[("agent_version", "TEXT NOT NULL DEFAULT ''")])?;
+    add_columns(conn, "details", &[("agent_version", "TEXT NOT NULL DEFAULT ''"), ("disks", "TEXT NOT NULL DEFAULT ''")])?;
+    // 分开判断系统盘和挂载盘的磁盘提醒用。旧被控、单盘机器不报，是空的，提醒退回看 disk。
+    add_columns(conn, "samples", &[("disk_root", "REAL"), ("disk_mount", "REAL")])?;
     add_columns(conn, "traffic", &[("boot", "TEXT NOT NULL DEFAULT ''")])?;
     // 排序。老数据全是 0，这时节点按名字、监控按 id 兜底；第一次点上下箭头时整张表重新编号。
     add_columns(conn, "nodes", &[("sort", "INTEGER NOT NULL DEFAULT 0")])?;
@@ -207,6 +225,16 @@ fn valid(m: &Metrics) -> bool {
         && m.cpu_model.len() <= 200 && m.cpu_cores <= 4096
         && m.version.len() <= 20 && m.version.bytes().all(|b| b.is_ascii_graphic())
         && m.boot.len() <= 64 && m.boot.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        && [m.disk_root, m.disk_mount].iter().flatten().all(|v| v.is_finite() && (0.0..=100.0).contains(v))
+        && valid_disks(&m.disks)
+}
+
+/// 分盘列表：最多 8 块，第一块必须是系统盘，路径以 / 开头、不含控制字符，已用不超过总量。
+fn valid_disks(disks: &[Disk]) -> bool {
+    disks.len() <= MAX_DISKS
+        && disks.first().map_or(true, |d| d.mount == "/")
+        && disks.iter().all(|d| d.mount.starts_with('/') && d.mount.len() <= MAX_MOUNT_PATH
+            && !d.mount.chars().any(char::is_control) && d.used <= d.total && d.total <= i64::MAX as u64)
 }
 
 fn equal_secret(actual: &str, provided: &str) -> bool {
@@ -427,7 +455,7 @@ fn read_nodes(path: &str, full: bool) -> rusqlite::Result<Vec<Node>> {
         (SELECT rx FROM traffic_day WHERE node_id=n.id AND day=CAST(strftime('%s','now','localtime') AS INTEGER)/86400),
         (SELECT tx FROM traffic_day WHERE node_id=n.id AND day=CAST(strftime('%s','now','localtime') AS INTEGER)/86400),
         0,0,
-        COALESCE(NULLIF(c.country,''),net.country),c.price,c.currency,c.billing_cycle,c.expires_at,c.traffic_limit,c.traffic_mode,c.traffic_reset_day,d.agent_version
+        COALESCE(NULLIF(c.country,''),net.country),c.price,c.currency,c.billing_cycle,c.expires_at,c.traffic_limit,c.traffic_mode,c.traffic_reset_day,d.agent_version,d.disks
         FROM nodes n LEFT JOIN samples s ON s.rowid = (SELECT rowid FROM samples WHERE node_id=n.id ORDER BY ts DESC,rowid DESC LIMIT 1)
         LEFT JOIN latest l ON l.node_id=n.id
         LEFT JOIN details d ON d.node_id=n.id LEFT JOIN traffic t ON t.node_id=n.id
@@ -467,7 +495,10 @@ fn read_nodes(path: &str, full: bool) -> rusqlite::Result<Vec<Node>> {
             expires_at:r.get::<_,Option<String>>(33)?.unwrap_or_default(),
             traffic_limit:r.get::<_,Option<i64>>(34)?.unwrap_or(0).max(0) as u64,
             traffic_mode:r.get::<_,Option<String>>(35)?.unwrap_or_default(),
-            traffic_reset_day:r.get::<_,Option<i64>>(36)?.unwrap_or(1) })
+            traffic_reset_day:r.get::<_,Option<i64>>(36)?.unwrap_or(1),
+            // 存的时候校验过；读出来不认识就当单盘，不让一台机器拖垮整个列表。
+            disks:r.get::<_,Option<String>>(38)?.and_then(|text| serde_json::from_str::<Vec<Disk>>(&text).ok())
+                .filter(|disks| disks.len() > 1 && valid_disks(disks)).unwrap_or_default() })
     })?;
     let mut list: Vec<Node> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     // 本月流量按每个节点自己的重置日算，不按自然月；日流量表留 35 天，覆盖得了任何一个周期。
@@ -487,6 +518,10 @@ fn read_nodes(path: &str, full: bool) -> rusqlite::Result<Vec<Node>> {
             // 内核版本对得上已知漏洞就能定向攻击，agent 版本同理。访客看发行版名称就够了。
             node.kernel.clear();
             node.agent_version.clear();
+            // 挂载路径可能看得出这台机器拿来干什么，访客那份只留系统盘的 /，主题显示成「挂载盘 1」这样。
+            for disk in &mut node.disks {
+                if disk.mount != "/" { disk.mount.clear(); }
+            }
         }
     }
     Ok(list)
@@ -544,18 +579,21 @@ fn store_metrics(tx: &Connection, id: &str, at: i64, m: &Metrics, last_sample: &
     tx.execute("INSERT OR REPLACE INTO latest VALUES (?,?,?,?,?,?,?,?)",
         params![id,m.cpu,m.memory,m.disk,m.rx,m.tx,m.load,m.uptime as i64])?;
     if at - *last_sample >= 60 {
-        tx.execute("INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?)",
-            params![id,at,m.cpu,m.memory,m.disk,m.rx,m.tx,m.load,m.uptime as i64])?;
+        tx.execute("INSERT OR REPLACE INTO samples(node_id,ts,cpu,memory,disk,rx,tx,load,uptime,disk_root,disk_mount) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            params![id,at,m.cpu,m.memory,m.disk,m.rx,m.tx,m.load,m.uptime as i64,m.disk_root,m.disk_mount])?;
         // 以前被控还会报一个到主控的握手延迟（latency_ms），已经删了：主控在 Cloudflare 后面，
         // 握手对象其实是离节点最近的 Cloudflare 机房，数值没有意义。没重装的老被控还会带着它，
         // 这里的结构体不拒绝多余字段，直接忽略。
         *last_sample = at;
     }
     if m.mem_total > 0 {
-        tx.execute("INSERT OR REPLACE INTO details VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![
+        // 单盘机器存空串，不存 "[]"。
+        let disks = if m.disks.is_empty() { String::new() } else { serde_json::to_string(&m.disks).unwrap_or_default() };
+        tx.execute("INSERT OR REPLACE INTO details(node_id,mem_used,mem_total,swap_used,swap_total,disk_used,disk_total,load5,load15,os,kernel,arch,cpu_model,cpu_cores,agent_version,disks)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![
             id,m.mem_used as i64,m.mem_total as i64,m.swap_used as i64,
             m.swap_total as i64,m.disk_used as i64,m.disk_total as i64,
-            m.load5,m.load15,m.os,m.kernel,m.arch,m.cpu_model,m.cpu_cores as i64,m.version])?;
+            m.load5,m.load15,m.os,m.kernel,m.arch,m.cpu_model,m.cpu_cores as i64,m.version,disks])?;
     }
     if m.rx_bytes > 0 || m.tx_bytes > 0 {
         let old: Option<(i64,i64,i64,i64,String)> = tx.query_row(
@@ -840,6 +878,62 @@ mod tests {
         assert!(!valid(&m));
         assert!(equal_secret("abc","abc"));
         assert!(!equal_secret("abc","ab"));
+    }
+
+    #[test]
+    fn checks_the_disk_list() {
+        let base = r#"{"cpu":1,"memory":2,"disk":3,"rx":0,"tx":0,"load":0,"uptime":9"#;
+        let with = |extra: &str| serde_json::from_str::<Metrics>(&format!("{base},{extra}}}")).unwrap();
+        let old: Metrics = serde_json::from_str(&format!("{base}}}")).unwrap();
+        assert!(valid(&old) && old.disks.is_empty() && old.disk_root.is_none(), "旧被控没有这几项");
+        assert!(valid(&with(r#""disk_root":13.4,"disk_mount":0,"disks":[{"mount":"/","used":1,"total":2},{"mount":"/data","used":0,"total":5}]"#)));
+        for bad in [
+            r#""disk_root":101"#,
+            r#""disk_mount":-1"#,
+            r#""disks":[{"mount":"/data","used":1,"total":2}]"#,
+            r#""disks":[{"mount":"/","used":3,"total":2}]"#,
+            r#""disks":[{"mount":"/","used":1,"total":2},{"mount":"data","used":1,"total":2}]"#,
+            r#""disks":[{"mount":"/","used":1,"total":2},{"mount":"/a\nb","used":1,"total":2}]"#,
+        ] {
+            assert!(!valid(&with(bad)), "{bad}");
+        }
+        let many = (0..9).map(|i| format!(r#"{{"mount":"/{}","used":1,"total":2}}"#, if i == 0 { String::new() } else { i.to_string() }))
+            .collect::<Vec<_>>().join(",");
+        assert!(!valid(&with(&format!(r#""disks":[{many}]"#))), "最多 8 块");
+        let long = format!(r#""disks":[{{"mount":"/","used":1,"total":2}},{{"mount":"/{}","used":1,"total":2}}]"#, "x".repeat(64));
+        assert!(!valid(&with(&long)), "路径最长 64 字节");
+    }
+
+    #[test]
+    fn disks_are_stored_and_hidden_from_visitors() {
+        let path = std::env::temp_dir().join(format!("avalon-disks-{}.db", std::process::id())).to_str().unwrap().to_string();
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
+        init_db(&path).unwrap();
+        let conn = db(&path).unwrap();
+        conn.execute("INSERT INTO nodes(id,name,token,public) VALUES('0123456789abcdef','a','t',1)", []).unwrap();
+        let multi: Metrics = serde_json::from_str(r#"{"cpu":1,"memory":2,"disk":0.1,"rx":0,"tx":0,"load":0,"uptime":9,"mem_total":100,
+            "disk_used":3,"disk_total":30,"disk_root":13.4,"disk_mount":0.5,
+            "disks":[{"mount":"/","used":2,"total":10},{"mount":"/data","used":1,"total":20}]}"#).unwrap();
+        let mut last = 0;
+        store_metrics(&conn, "0123456789abcdef", 1000, &multi, &mut last).unwrap();
+        let stored: (f64, Option<f64>, Option<f64>) = conn.query_row("SELECT disk,disk_root,disk_mount FROM samples", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(stored, (0.1, Some(13.4), Some(0.5)));
+        let admin = read_nodes(&path, true).unwrap();
+        assert_eq!((admin[0].disk_used, admin[0].disk_total), (3, 30), "总和照旧");
+        assert_eq!(admin[0].disks, multi.disks, "登录后看得到挂载路径");
+        let guest = read_nodes(&path, false).unwrap();
+        assert_eq!(guest[0].disks.iter().map(|d| d.mount.as_str()).collect::<Vec<_>>(), ["/", ""], "访客只看得到系统盘的 /");
+        assert_eq!(guest[0].disks[1].total, 20);
+        // 换回旧被控（或拔掉数据盘）：分盘清空，提醒用的两列是空的。
+        let single: Metrics = serde_json::from_str(r#"{"cpu":1,"memory":2,"disk":20,"rx":0,"tx":0,"load":0,"uptime":9,"mem_total":100,"disk_used":2,"disk_total":10}"#).unwrap();
+        store_metrics(&conn, "0123456789abcdef", 2000, &single, &mut last).unwrap();
+        assert!(read_nodes(&path, true).unwrap()[0].disks.is_empty());
+        let (root, mount): (Option<f64>, Option<f64>) = conn.query_row("SELECT disk_root,disk_mount FROM samples WHERE ts=2000", [],
+            |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((root, mount), (None, None));
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] { let _ = std::fs::remove_file(format!("{path}{suffix}")); }
     }
 
     #[test]
