@@ -1479,7 +1479,8 @@ fn resource_lines(conn:&Connection)->rusqlite::Result<(Vec<String>,Vec<(String,i
             pending.push((key.clone(),now_over as i64));
             let current=values.first().map_or(0,|v|v.round() as i64);
             // 挂载盘写出是哪一块（最满的那块）。Telegram 只发给自己，写真实路径没问题。
-            let label=if column==4 {fullest_mount(conn,&id)?.map_or_else(||label.to_string(),|path|format!("{label} {path}"))} else {label.to_string()};
+            // 路径后面补一个空格，不然和后面的「持续在」「已恢复」粘在一起。
+            let label=if column==4 {fullest_mount(conn,&id)?.map_or_else(||label.to_string(),|path|format!("{label} {path} "))} else {label.to_string()};
             lines.push(if now_over {
                 format!("节点 {name} {label}持续在 {limit}% 以上，现在 {current}%")
             } else {
