@@ -173,14 +173,14 @@ systemctl enable probe-agent >/dev/null 2>&1
 systemctl restart probe-agent
 sleep 3
 
-# 部分 LXC 容器不允许服务建挂载命名空间，上面那些文件系统隔离会让服务起不来（226/NAMESPACE）。
-# 这时只撤掉依赖命名空间的那几项；非 root 用户、无特权能力、系统调用白名单这些照旧保留。
-if ! systemctl is-active --quiet probe-agent \
-    && [ "$(systemctl show -p ExecMainStatus --value probe-agent 2>/dev/null)" = 226 ]; then
-    say "这台机器（多半是 LXC 容器）不支持文件系统隔离，改用兼容配置……"
+restart_agent() { systemctl daemon-reload; systemctl restart probe-agent; sleep 3; }
+
+# 文件系统隔离全部撤掉，非 root 用户、无特权能力、系统调用白名单这些照旧保留。
+container_conf() {
     install -d -m 755 "$DROPIN_DIR"
+    rm -f "$DROPIN_DIR/lxcfs.conf"
     cat > "$DROPIN_DIR/container.conf" <<'EOF'
-# 由安装脚本生成：容器不支持挂载命名空间。非 root 运行和系统调用白名单仍然生效。
+# 由安装脚本生成：容器里文件系统隔离用不了。非 root 运行和系统调用白名单仍然生效。
 [Service]
 ProtectSystem=false
 ProtectHome=false
@@ -196,15 +196,62 @@ ProtectClock=false
 ProtectHostname=false
 EOF
     chmod 644 "$DROPIN_DIR/container.conf"
-    systemctl daemon-reload
-    systemctl restart probe-agent
-    sleep 3
+}
+
+# agent 看到的内存和 CPU 要和这里一样：总内存、总交换、/proc/stat 里的 CPU 行数。
+# LXC 容器靠 LXCFS 把 /proc/meminfo、/proc/stat 换成容器自己的数字，可沙箱会给 agent 新挂一个 /proc，
+# 那层就没了，读到的是整台宿主。不猜是哪种容器、哪一项隔离：装好后直接比，不一样就放宽一级再比。
+view() {
+    printf '%s|%s|%s' "$(grep -m1 '^MemTotal:' "$1/proc/meminfo" 2>/dev/null || true)" \
+        "$(grep -m1 '^SwapTotal:' "$1/proc/meminfo" 2>/dev/null || true)" \
+        "$(grep -c '^cpu' "$1/proc/stat" 2>/dev/null || true)"
+}
+# agent 那边用 /proc/<进程号>/root 去读，走的是它自己的挂载命名空间。读不到就当一样，不为这个放宽隔离。
+same_view() {
+    pid=$(systemctl show -p MainPID --value probe-agent 2>/dev/null || true)
+    case "$pid" in ''|0|*[!0-9]*) return 0 ;; esac
+    theirs=$(view "/proc/$pid/root")
+    case "$theirs" in '|'*) return 0 ;; esac
+    [ "$theirs" = "$(view '')" ]
+}
+
+# 部分 LXC 容器不允许服务建挂载命名空间，文件系统隔离会让服务起不来（226/NAMESPACE）。
+if ! systemctl is-active --quiet probe-agent \
+    && [ "$(systemctl show -p ExecMainStatus --value probe-agent 2>/dev/null)" = 226 ]; then
+    say "这台机器（多半是 LXC 容器）不支持文件系统隔离，改用兼容配置……"
+    container_conf
+    restart_agent
+fi
+
+MODE=sandbox
+[ -e "$DROPIN_DIR/container.conf" ] && MODE=container
+if [ "$MODE" = sandbox ] && ! same_view; then
+    say "agent 在沙箱里读到的内存 / CPU 和本机不一样（多半是 LXC 容器），放宽三项隔离……"
+    install -d -m 755 "$DROPIN_DIR"
+    cat > "$DROPIN_DIR/lxcfs.conf" <<'EOF'
+# 由安装脚本生成：这三项会给 agent 新挂一个 /proc，LXCFS 盖在上面的那层就没了，读到的是整台宿主。
+# 其余隔离照旧。agent 是普通用户、没有任何特权，本来就改不了内核参数和 cgroup。
+[Service]
+ProtectProc=default
+ProtectKernelTunables=false
+ProtectControlGroups=false
+EOF
+    chmod 644 "$DROPIN_DIR/lxcfs.conf"
+    restart_agent
+    MODE=relaxed
+fi
+if [ "$MODE" = relaxed ] && ! same_view; then
+    say "还是不一样，改用兼容配置……"
+    container_conf
+    restart_agent
+    MODE=container
 fi
 
 if ! systemctl is-active --quiet probe-agent; then
     say "agent 没能启动，看日志：journalctl -u probe-agent -n 30 --no-pager"
     exit 1
 fi
+same_view || say "注意：agent 读到的内存 / CPU 和本机对不上，面板上这台的数字可能不准。"
 
 # 从旧版升级上来的：probe 用户原来只给 agent 用，现在没人用了就删掉。
 # 这台如果同时跑着 hub（probe-hub.service 在），probe 是 hub 的用户，不动。
@@ -213,8 +260,8 @@ if [ "$OLD_USER" = probe ] && [ ! -e /etc/systemd/system/probe-hub.service ] \
     userdel probe 2>/dev/null || true
 fi
 
-if [ -e "$DROPIN_DIR/container.conf" ]; then
-    say "安装完成（容器兼容模式），agent 以 $AGENT_USER 用户运行。几秒后面板上就能看到这台机器。"
-else
-    say "安装完成，agent 以 $AGENT_USER 用户在沙箱里运行。几秒后面板上就能看到这台机器。"
-fi
+case "$MODE" in
+    container) say "安装完成（容器兼容模式），agent 以 $AGENT_USER 用户运行。几秒后面板上就能看到这台机器。" ;;
+    relaxed) say "安装完成，agent 以 $AGENT_USER 用户在沙箱里运行（为读到容器自己的内存和 CPU 放宽了三项）。几秒后面板上就能看到这台机器。" ;;
+    *) say "安装完成，agent 以 $AGENT_USER 用户在沙箱里运行。几秒后面板上就能看到这台机器。" ;;
+esac

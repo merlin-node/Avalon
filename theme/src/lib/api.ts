@@ -84,7 +84,7 @@ type ProbeNode = {
   load: number; load5: number; load15: number; uptime: number
   mem_used: number; mem_total: number; swap_used: number; swap_total: number
   disk_used: number; disk_total: number; os: string; kernel: string
-  arch: string; cpu_model: string; cpu_cores: number; agent_version?: string
+  arch: string; cpu_model: string; cpu_cores: number; agent_version?: string; virt?: string
   rx_total: number; tx_total: number; day_rx: number; day_tx: number
   month_rx: number; month_tx: number
   country?: string; price?: number; currency?: string; billing_cycle?: string; expires_at?: string
@@ -118,7 +118,7 @@ export function adaptNode(n: ProbeNode, sort = 0): Node {
   return {
     id, name: n.name, sort, public: true, online: n.online, country: n.country ?? "",
     last_seen: n.last_seen ?? 0, metrics: n.online ? m : null,
-    os: n.os, kernel: n.kernel, arch: n.arch, virt: "", cpu_name: n.cpu_model,
+    os: n.os, kernel: n.kernel, arch: n.arch, virt: n.virt ?? "", cpu_name: n.cpu_model,
     cpu_cores: n.cpu_cores, mem_total: n.mem_total, swap_total: n.swap_total,
     disk_total: n.disk_total, disks: diskList(n.disks), agent_version: n.agent_version ?? "", price: n.price ?? 0,
     billing_known: Boolean(n.billing_cycle || n.currency || n.price || n.expires_at), currency: n.currency ?? "",

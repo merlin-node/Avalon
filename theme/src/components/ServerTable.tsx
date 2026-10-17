@@ -9,7 +9,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import type { Node } from "@/lib/api"
 import {
   bytes, compact, CYCLES, daysUntil, distro, duration, FOREVER, money, monthUsage, osName, cpuName, pair,
-  percent, speed, speedRate, uptime,
+  percent, sharedKernel, speed, speedRate, uptime,
 } from "@/lib/format"
 import { Link } from "@/lib/route"
 import { cn } from "@/lib/utils"
@@ -167,10 +167,15 @@ function Details({ node, chart }: { node: Node; chart: boolean }) {
           </span>
         </Line>
         <Line label="架构">
-          {[node.arch, node.virt !== "none" && node.virt, node.agent_version && `agent ${node.agent_version}`]
-            .filter(Boolean)
-            .join(" · ") || "—"}
+          {[node.arch, node.agent_version && `agent ${node.agent_version}`].filter(Boolean).join(" · ") || "—"}
         </Line>
+        {/* 物理机（none）和没报类型的旧被控不显示这一行。手机上紧跟架构；电脑上一行三项按主题排，
+            插在这里会把后面整片挤歪，所以挪到最后一行。 */}
+        {node.virt && node.virt !== "none" && (
+          <div className="@2xl:order-last">
+            <Line label="虚拟化">{node.virt}</Line>
+          </div>
+        )}
         <Line label="CPU">
           {node.cpu_name ? `${cpuName(node.cpu_name)} × ${node.cpu_cores}` : `${node.cpu_cores} 核`}
           {m && `（${m.cpu.toFixed(1)}%）`}
@@ -195,8 +200,9 @@ function Details({ node, chart }: { node: Node; chart: boolean }) {
         {/* The 1-minute figure over the core count: 100% is every core busy, above it
             work is queueing, so it is not capped. Waiting on the disk counts too, which
             is why it can sit well above the CPU percentage. */}
+        {/* 容器的负载是整台宿主的，不显示。 */}
         <Line label="负载">
-          {m
+          {m && !sharedKernel(node.virt)
             ? `${m.load.map((n) => n.toFixed(2)).join(" / ")}${node.cpu_cores > 0 ? `（${Math.round((m.load[0] / node.cpu_cores) * 100)}%）` : ""}`
             : "—"}
         </Line>
@@ -344,7 +350,7 @@ function Row({ node, index }: { node: Node; index: number }) {
         </TableCell>
         <TableCell className={COL.uptime}>{m ? duration(m.uptime) : "—"}</TableCell>
         <TableCell className={COL.expiry}><Expiry node={node} /></TableCell>
-        <TableCell className={COL.load}>{m ? m.load[0].toFixed(2) : "—"}</TableCell>
+        <TableCell className={COL.load}>{m && !sharedKernel(node.virt) ? m.load[0].toFixed(2) : "—"}</TableCell>
         <TableCell className={COL.speed}>{m ? `${speed(m.net_rx)} | ${speed(m.net_tx)}` : "— | —"}</TableCell>
         <TableCell className={COL.bar}><Bar pct={m ? m.cpu : null} /></TableCell>
         <TableCell className={COL.bar}><Bar pct={m ? percent(m.mem_used, m.mem_total) : null} /></TableCell>

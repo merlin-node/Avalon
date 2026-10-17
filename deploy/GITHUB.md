@@ -29,13 +29,13 @@ cd /root && rm -rf avalon-push avalon-update.zip
 
 ## GitHub 令牌
 
-推送用的令牌有效期 30 天，过期了推送会提示认证失败，重新建一个：
+推送用的令牌永不过期。要是删了或者丢了，推送会提示认证失败，照下面重新建一个：
 
 GitHub 右上角头像 → **Settings** → 最底下 **Developer settings** → **Personal access tokens** → **Fine-grained tokens** → **Generate new token**：
 
-- **Expiration**：30 days
+- **Expiration**：No expiration
 - **Repository access**：Only select repositories → 选 `Avalon`
-- **Permissions → Repositories**：点 **+** 加 **Contents** 和 **Workflows**，都改成 **Read and write**
+- **Permissions → Repositories**：点 **+** 加 **Contents** 和 **Workflows**，都改成 **Read and write**（Metadata 会自动加上只读，不用管）
 - 生成后复制 `github_pat_` 开头那串存进 Bitwarden，替换旧的
 
 ## Actions 红了怎么看

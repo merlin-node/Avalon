@@ -153,6 +153,12 @@ pub(super) fn metered(mode: &str, rx: i64, tx: i64) -> i64 {
     }
 }
 
+/// 容器和宿主共用内核，/proc/loadavg 是整台宿主的负载，拿来和容器自己的核数比没有意义，
+/// 负载提醒跳过这种机器。名单是 systemd-detect-virt 认的那几种容器，公开页主题里有同一份。
+pub(super) fn shared_kernel(virt: &str) -> bool {
+    matches!(virt, "openvz" | "lxc" | "lxc-libvirt" | "systemd-nspawn" | "docker" | "podman" | "rkt" | "wsl" | "proot" | "pouch")
+}
+
 /// 同一轮的多条提醒合成一条。Telegram 一条最多 4096 字，条数多了截掉，末尾说一声还有几条。
 pub(super) fn bundle(lines: &[String]) -> Option<String> {
     const MAX_LINES: usize = 40;
@@ -167,6 +173,12 @@ pub(super) fn bundle(lines: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn containers_have_no_load_of_their_own() {
+        assert!(shared_kernel("lxc") && shared_kernel("openvz") && shared_kernel("docker"));
+        assert!(!shared_kernel("kvm") && !shared_kernel("none") && !shared_kernel(""), "虚拟机、物理机、旧被控照常判断负载");
+    }
 
     fn sample(over: usize, under: usize) -> Vec<f64> {
         std::iter::repeat(95.0).take(over).chain(std::iter::repeat(10.0).take(under)).collect()

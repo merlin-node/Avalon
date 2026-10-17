@@ -1,6 +1,6 @@
 [package]
 name = "linux-probe"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # src/bin 下的 admin.rs、ping.rs 是 hub 的模块，不是独立程序。
 # 不关掉自动发现，cargo 会把它们各自当成一个二进制去编译，然后报几百个错。

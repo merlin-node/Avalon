@@ -56,6 +56,8 @@ struct Metrics {
     #[serde(default)] cpu_model: String,
     #[serde(default)] cpu_cores: u32,
     #[serde(default)] version: String,
+    /// 虚拟化类型（lxc、kvm、none……）。旧被控不报，是空的。容器的负载是宿主的，提醒和页面都不看它。
+    #[serde(default)] virt: String,
     /// /proc/sys/kernel/random/boot_id。每次开机都会变，用来判断流量计数器是不是同一次开机的。
     #[serde(default)] boot: String,
     /// 下面三项只有挂了数据盘的机器才报，旧被控和单盘机器都没有。disk_used / disk_total / disk 是所有盘之和。
@@ -92,6 +94,8 @@ struct Node {
     disk_used: u64, disk_total: u64, load5: f64, load15: f64,
     os: String, kernel: String, arch: String, cpu_model: String, cpu_cores: u32,
     agent_version: String,
+    /// 访客也看得到：只是 lxc、kvm 这样的类型名，看不出版本。
+    virt: String,
     rx_total: u64, tx_total: u64, day_rx: u64, day_tx: u64, month_rx: u64, month_tx: u64,
     country: String, price: f64, currency: String, billing_cycle: String, expires_at: String,
     traffic_limit: u64, traffic_mode: String, traffic_reset_day: i64,
@@ -177,7 +181,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("traffic_reset_day", "INTEGER NOT NULL DEFAULT 1"),
         ("auto_renew", "INTEGER NOT NULL DEFAULT 1"),
     ])?;
-    add_columns(conn, "details", &[("agent_version", "TEXT NOT NULL DEFAULT ''"), ("disks", "TEXT NOT NULL DEFAULT ''")])?;
+    add_columns(conn, "details", &[("agent_version", "TEXT NOT NULL DEFAULT ''"), ("disks", "TEXT NOT NULL DEFAULT ''"), ("virt", "TEXT NOT NULL DEFAULT ''")])?;
     // 分开判断系统盘和挂载盘的磁盘提醒用。旧被控、单盘机器不报，是空的，提醒退回看 disk。
     add_columns(conn, "samples", &[("disk_root", "REAL"), ("disk_mount", "REAL")])?;
     add_columns(conn, "traffic", &[("boot", "TEXT NOT NULL DEFAULT ''")])?;
@@ -224,6 +228,7 @@ fn valid(m: &Metrics) -> bool {
         && m.os.len() <= 160 && m.kernel.len() <= 160 && m.arch.len() <= 80
         && m.cpu_model.len() <= 200 && m.cpu_cores <= 4096
         && m.version.len() <= 20 && m.version.bytes().all(|b| b.is_ascii_graphic())
+        && m.virt.len() <= 32 && m.virt.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && m.boot.len() <= 64 && m.boot.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
         && [m.disk_root, m.disk_mount].iter().flatten().all(|v| v.is_finite() && (0.0..=100.0).contains(v))
         && valid_disks(&m.disks)
@@ -455,7 +460,7 @@ fn read_nodes(path: &str, full: bool) -> rusqlite::Result<Vec<Node>> {
         (SELECT rx FROM traffic_day WHERE node_id=n.id AND day=CAST(strftime('%s','now','localtime') AS INTEGER)/86400),
         (SELECT tx FROM traffic_day WHERE node_id=n.id AND day=CAST(strftime('%s','now','localtime') AS INTEGER)/86400),
         0,0,
-        COALESCE(NULLIF(c.country,''),net.country),c.price,c.currency,c.billing_cycle,c.expires_at,c.traffic_limit,c.traffic_mode,c.traffic_reset_day,d.agent_version,d.disks
+        COALESCE(NULLIF(c.country,''),net.country),c.price,c.currency,c.billing_cycle,c.expires_at,c.traffic_limit,c.traffic_mode,c.traffic_reset_day,d.agent_version,d.disks,d.virt
         FROM nodes n LEFT JOIN samples s ON s.rowid = (SELECT rowid FROM samples WHERE node_id=n.id ORDER BY ts DESC,rowid DESC LIMIT 1)
         LEFT JOIN latest l ON l.node_id=n.id
         LEFT JOIN details d ON d.node_id=n.id LEFT JOIN traffic t ON t.node_id=n.id
@@ -482,6 +487,7 @@ fn read_nodes(path: &str, full: bool) -> rusqlite::Result<Vec<Node>> {
             cpu_model:r.get::<_,Option<String>>(21)?.unwrap_or_default(),
             cpu_cores:r.get::<_,Option<i64>>(22)?.unwrap_or(0).max(0) as u32,
             agent_version:r.get::<_,Option<String>>(37)?.unwrap_or_default(),
+            virt:r.get::<_,Option<String>>(39)?.unwrap_or_default(),
             rx_total:r.get::<_,Option<i64>>(23)?.unwrap_or(0).max(0) as u64,
             tx_total:r.get::<_,Option<i64>>(24)?.unwrap_or(0).max(0) as u64,
             day_rx:r.get::<_,Option<i64>>(25)?.unwrap_or(0).max(0) as u64,
@@ -589,11 +595,11 @@ fn store_metrics(tx: &Connection, id: &str, at: i64, m: &Metrics, last_sample: &
     if m.mem_total > 0 {
         // 单盘机器存空串，不存 "[]"。
         let disks = if m.disks.is_empty() { String::new() } else { serde_json::to_string(&m.disks).unwrap_or_default() };
-        tx.execute("INSERT OR REPLACE INTO details(node_id,mem_used,mem_total,swap_used,swap_total,disk_used,disk_total,load5,load15,os,kernel,arch,cpu_model,cpu_cores,agent_version,disks)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![
+        tx.execute("INSERT OR REPLACE INTO details(node_id,mem_used,mem_total,swap_used,swap_total,disk_used,disk_total,load5,load15,os,kernel,arch,cpu_model,cpu_cores,agent_version,disks,virt)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![
             id,m.mem_used as i64,m.mem_total as i64,m.swap_used as i64,
             m.swap_total as i64,m.disk_used as i64,m.disk_total as i64,
-            m.load5,m.load15,m.os,m.kernel,m.arch,m.cpu_model,m.cpu_cores as i64,m.version,disks])?;
+            m.load5,m.load15,m.os,m.kernel,m.arch,m.cpu_model,m.cpu_cores as i64,m.version,disks,m.virt])?;
     }
     if m.rx_bytes > 0 || m.tx_bytes > 0 {
         let old: Option<(i64,i64,i64,i64,String)> = tx.query_row(

@@ -199,6 +199,15 @@ export function osName(name: string): string {
   return name.replace("GNU/Linux ", "").replace(/\s*\([^)]*\)\s*$/, "")
 }
 
+/**
+ * 容器和宿主共用内核，/proc/loadavg 是整台宿主的负载，和容器自己的核数比不出东西，页面上显示「—」。
+ * 名单是 systemd-detect-virt 认的那几种容器，和 hub 的 rules::shared_kernel 是同一份。
+ */
+const CONTAINERS = new Set(["openvz", "lxc", "lxc-libvirt", "systemd-nspawn", "docker", "podman", "rkt", "wsl", "proot", "pouch"])
+export function sharedKernel(virt: string): boolean {
+  return CONTAINERS.has(virt)
+}
+
 export function cpuName(name: string): string {
   return name
     .replace(/\((R|TM|r|tm)\)/g, "")

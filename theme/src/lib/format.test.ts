@@ -5,7 +5,7 @@
 // Nothing imports it, so the bundle never includes it.
 import {
   axisBytes, axisTop, bytes, compact, cpuName, daysUntil, distro, duration, money, monthUsage, osName, pair, quarters,
-  speed, speedRate, timeTicks, uptime,
+  sharedKernel, speed, speedRate, timeTicks, uptime,
 } from "./format.ts"
 
 let failed = 0
@@ -140,6 +140,10 @@ eq(duration(76 * 86400 + 5), "76 天", "超过一天只写天数")
 
 eq(osName("Debian GNU/Linux 12 (bookworm)"), "Debian 12", "发行版名去掉代号")
 eq(cpuName("Intel(R) Xeon(R) CPU E5-2680 8-Core Processor"), "Intel Xeon E5-2680", "CPU 名去掉商标和核数")
+
+// 容器的负载是宿主的，不显示；虚拟机、物理机、没报类型的旧被控照常显示。
+eq([sharedKernel("lxc"), sharedKernel("openvz"), sharedKernel("docker")], [true, true, true], "容器")
+eq([sharedKernel("kvm"), sharedKernel("none"), sharedKernel("")], [false, false, false], "虚拟机、物理机、旧被控")
 
 if (failed) {
   console.error(`\n${failed} 项不通过`)

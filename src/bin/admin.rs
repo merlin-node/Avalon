@@ -1419,13 +1419,13 @@ fn resource_lines(conn:&Connection)->rusqlite::Result<(Vec<String>,Vec<(String,i
     let at=now();
     let mut lines=Vec::new();
     let mut pending:Vec<(String,i64)>=Vec::new();
-    let mut stmt=conn.prepare("SELECT n.id,n.name,n.last_seen,COALESCE(d.cpu_cores,0),COALESCE(c.traffic_limit,0),COALESCE(c.traffic_mode,''),COALESCE(c.traffic_reset_day,1)
+    let mut stmt=conn.prepare("SELECT n.id,n.name,n.last_seen,COALESCE(d.cpu_cores,0),COALESCE(c.traffic_limit,0),COALESCE(c.traffic_mode,''),COALESCE(c.traffic_reset_day,1),COALESCE(d.virt,'')
         FROM nodes n LEFT JOIN details d ON d.node_id=n.id LEFT JOIN node_config c ON c.node_id=n.id ORDER BY n.sort,n.name")?;
-    let nodes=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?)))?
+    let nodes=stmt.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?,r.get::<_,String>(7)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let state=|key:&str|->rusqlite::Result<i64> {Ok(read_state(conn,key)?.unwrap_or(0))};
     let store=|key:&str,value:i64|write_state(conn,key,value);
-    for (id,name,seen,cores,limit,mode,reset) in nodes {
+    for (id,name,seen,cores,limit,mode,reset,virt) in nodes {
         let rule=members.get(&id);
         // 流量：每个周期到阈值一次、用完一次。状态存「周期起始日 × 10 + 已发到第几级」，进了新周期自动作废。
         let key=format!("traffic:{id}");
@@ -1467,6 +1467,8 @@ fn resource_lines(conn:&Connection)->rusqlite::Result<(Vec<String>,Vec<(String,i
         for (kind,label,limit,column) in checks {
             let key=format!("{kind}:{id}");
             let was=state(&key)?==1;
+            // 容器的负载是整台宿主的，和规则里这项留空一样处理：不判断，以前记下的状态悄悄清零。
+            let limit=if column==3&&rules::shared_kernel(&virt) {None} else {limit};
             let Some(limit)=limit else {if was {store(&key,0)?;} continue};
             if !online {continue}
             // 负载换成百分比：1 分钟负载 ÷ 核数，和公开页上括号里的一样。不知道核数就不判断。
@@ -1832,6 +1834,34 @@ mod tests {
         fill(95.0,95.0);
         let (lines,_)=resource_lines(&conn).unwrap();
         assert_eq!(lines,["节点 DE 挂载盘 /data 持续在 90% 以上，现在 95%"],"系统盘已经报过不再重复；挂载盘写最满的那块");
+        for suffix in ["","-wal","-shm"] {let _=std::fs::remove_file(format!("{path}{suffix}"));}
+    }
+
+    /// 容器的负载是宿主的：kvm 上照常报；同一台换成 lxc 后不再判断，以前记下的超标状态悄悄清零，不发「已恢复」。
+    #[test]
+    fn load_alerts_skip_containers() {
+        let path=std::env::temp_dir().join(format!("avalon-load-alert-{}.db",std::process::id())).to_str().unwrap().to_string();
+        for suffix in ["","-wal","-shm"] {let _=std::fs::remove_file(format!("{path}{suffix}"));}
+        init_db(&path).unwrap();
+        let conn=db(&path).unwrap();
+        let at=now();
+        conn.execute("INSERT INTO nodes(id,name,token,public,last_seen) VALUES('0123456789abcdef','LX','t',1,?)",[at]).unwrap();
+        conn.execute("UPDATE alert_rules SET load=100",[]).unwrap();
+        conn.execute("INSERT INTO alert_rule_nodes(node_id,rule_id) SELECT '0123456789abcdef',id FROM alert_rules",[]).unwrap();
+        let report=|virt:&str|serde_json::from_str::<Metrics>(&format!(r#"{{"cpu":1,"memory":2,"disk":3,"rx":0,"tx":0,"load":15,"uptime":9,
+            "mem_total":100,"cpu_cores":1,"virt":"{virt}"}}"#)).unwrap();
+        let fill=|virt:&str|{
+            let mut last=0;
+            for i in 0..10 {store_metrics(&conn,"0123456789abcdef",at-540+i*60,&report(virt),&mut last).unwrap();}
+        };
+        fill("kvm");
+        let (lines,pending)=resource_lines(&conn).unwrap();
+        assert_eq!(lines,["节点 LX 负载持续在 100% 以上，现在 1500%"]);
+        for (key,value) in &pending {write_state(&conn,key,*value).unwrap();}
+        fill("lxc");
+        let (lines,_)=resource_lines(&conn).unwrap();
+        assert!(lines.is_empty(),"{lines:?}");
+        assert_eq!(read_state(&conn,"load:0123456789abcdef").unwrap().unwrap_or(0),0,"状态清零，以后换回虚拟机也不会冒出一条「已恢复」");
         for suffix in ["","-wal","-shm"] {let _=std::fs::remove_file(format!("{path}{suffix}"));}
     }
 }

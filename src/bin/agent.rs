@@ -58,6 +58,9 @@ struct Metrics {
     cpu_cores: u32,
     /// 排查「hub 升了 agent 没升」时唯一能指望的东西。
     version: &'static str,
+    /// 虚拟化类型，名字基本照 systemd-detect-virt（lxc、openvz、kvm……），物理机是 none。
+    /// 容器和宿主共用内核，负载是整台宿主的，hub 和页面据此不判断、不显示负载。
+    virt: String,
     /// 本次开机的 ID。hub 靠它区分「计数器涨了」和「机器重启过、计数器从零开始」，
     /// agent 自己不存任何状态。
     boot: String,
@@ -115,7 +118,7 @@ enum Down {
     Tasks { tasks: Vec<Task> },
 }
 
-struct SystemInfo { os: String, kernel: String, arch: String, cpu_model: String, cpu_cores: u32, boot: String }
+struct SystemInfo { os: String, kernel: String, arch: String, cpu_model: String, cpu_cores: u32, boot: String, virt: String }
 
 fn system_info() -> SystemInfo {
     let os = fs::read_to_string("/etc/os-release").ok().and_then(|text| text.lines()
@@ -129,7 +132,91 @@ fn system_info() -> SystemInfo {
     SystemInfo { os: os.chars().take(80).collect(), kernel: kernel.chars().take(80).collect(),
         arch: std::env::consts::ARCH.into(), cpu_model: cpu_model.chars().take(100).collect(),
         cpu_cores: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1),
-        boot: fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().chars().take(64).collect() }
+        boot: fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default().trim().chars().take(64).collect(),
+        virt: virtualization() }
+}
+
+/// 上报的虚拟化名字：1 到 32 个小写字母、数字或 -，hub 按同样的规则校验。
+fn valid_virt(name: &str) -> bool {
+    (1..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// 先认容器再认虚拟机：容器里 CPUID 读到的是宿主那层的虚拟机。都不是就是 none。
+fn virtualization() -> String {
+    let mounts = parse_mountinfo(&fs::read_to_string("/proc/self/mountinfo").unwrap_or_default());
+    container(std::path::Path::new("/"), &mounts)
+        .or_else(|| hypervisor().map(Into::into))
+        .unwrap_or_else(|| "none".into())
+}
+
+/// 只看普通用户读得到的痕迹：agent 以 probe-agent 运行，1 号进程的环境变量读不到。
+/// - OpenVZ：有 /proc/vz、没有 /proc/bc（宿主两个都有）
+/// - systemd 作为容器里的 1 号进程写下的 /run/systemd/container
+/// - Docker、Podman 放进每个容器的标记文件
+/// - LXCFS：Proxmox 和 LXD 的容器里，它盖在 /proc 和 /sys 的几个文件上。沙箱给 agent 新挂的 /proc
+///   上没有它，所以挂载表里任何位置都算；宿主机自己挂在 /var/lib/lxcfs 的不算
+fn container(root: &std::path::Path, mounts: &[Mount]) -> Option<String> {
+    let has = |path: &str| root.join(path).exists();
+    if has("proc/vz") && !has("proc/bc") { return Some("openvz".into()); }
+    if let Some(name) = fs::read_to_string(root.join("run/systemd/container")).ok()
+        .map(|text| text.trim().to_string()).filter(|name| valid_virt(name)) {
+        return Some(name);
+    }
+    if has(".dockerenv") { return Some("docker".into()); }
+    if has("run/.containerenv") { return Some("podman".into()); }
+    mounts.iter().any(|m| m.fstype == "fuse.lxcfs" && m.point != "/var/lib/lxcfs" && !m.point.starts_with("/var/lib/lxcfs/"))
+        .then(|| "lxc".into())
+}
+
+/// 下面这层虚拟机，物理机是 None。Xen 先问：PV 客户机没有 CPUID 签名。
+fn hypervisor() -> Option<&'static str> {
+    if std::path::Path::new("/proc/xen").exists() || std::path::Path::new("/sys/hypervisor/type").exists() {
+        return Some("xen");
+    }
+    platform_hypervisor()
+}
+
+/// x86 的虚拟机在 CPUID 0x40000000 里报自己的名字（前提是 1 号叶的 hypervisor 位亮着）。
+/// DMI 是厂商随便填的，同一个 KVM 有 KVM、QEMU、Bochs、Alibaba Cloud ECS 好几种写法，不用它。
+#[cfg(target_arch = "x86_64")]
+fn platform_hypervisor() -> Option<&'static str> {
+    use std::arch::x86_64::__cpuid;
+    // 新版 Rust 里 __cpuid 已经不是 unsafe 了，旧版还是；两边都能编译。
+    #[allow(unused_unsafe)]
+    let (flags, leaf) = unsafe { (__cpuid(1), __cpuid(0x4000_0000)) };
+    if flags.ecx >> 31 == 0 { return None; }
+    let mut signature = [0_u8; 12];
+    for (bytes, register) in signature.chunks_mut(4).zip([leaf.ebx, leaf.ecx, leaf.edx]) {
+        bytes.copy_from_slice(&register.to_le_bytes());
+    }
+    Some(hypervisor_name(&signature))
+}
+
+/// CPUID 签名对应的名字。基本照 systemd-detect-virt，只把 microsoft 写成 hyper-v、oracle 写成 virtualbox
+/// （免得看成甲骨文云）；认不出的写 vm。
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn hypervisor_name(signature: &[u8; 12]) -> &'static str {
+    match signature {
+        b"KVMKVMKVM\0\0\0" | b"Linux KVM Hv" => "kvm",
+        b"TCGTCGTCGTCG" => "qemu",
+        b"Microsoft Hv" => "hyper-v",
+        b"VMwareVMware" => "vmware",
+        b"VBoxVBoxVBox" => "virtualbox",
+        b"XenVMMXenVMM" => "xen",
+        b"bhyve bhyve " => "bhyve",
+        _ => "vm",
+    }
+}
+
+/// ARM 没有 CPUID：有 QEMU 的 fw_cfg 设备就是 KVM，其余看 DMI（AWS、GCP 是 KVM，Azure 是 Hyper-V）。
+#[cfg(not(target_arch = "x86_64"))]
+fn platform_hypervisor() -> Option<&'static str> {
+    if std::path::Path::new("/sys/bus/acpi/devices/QEMU0002:00").exists() { return Some("kvm"); }
+    let dmi = ["product_name", "sys_vendor"]
+        .map(|f| fs::read_to_string(format!("/sys/class/dmi/id/{f}")).unwrap_or_default().to_lowercase())
+        .join(" ");
+    [("kvm", "kvm"), ("qemu", "kvm"), ("amazon ec2", "kvm"), ("google", "kvm"), ("microsoft", "hyper-v"), ("vmware", "vmware")]
+        .into_iter().find_map(|(word, name)| dmi.contains(word).then_some(name))
 }
 
 struct Counters { total: u64, idle: u64, rx: u64, tx: u64, nics: u32, at: Instant }
@@ -410,7 +497,7 @@ fn read_metrics(previous: &mut Option<Counters>, system: &SystemInfo) -> io::Res
         mem_used,mem_total,swap_used,swap_total,disk_used,disk_total,rx_bytes:rx,tx_bytes:tx,
         load5,load15,os:system.os.clone(),kernel:system.kernel.clone(),arch:system.arch.clone(),
         cpu_model:system.cpu_model.clone(),cpu_cores:system.cpu_cores,
-        version:env!("CARGO_PKG_VERSION"),
+        version:env!("CARGO_PKG_VERSION"), virt:system.virt.clone(),
         // 开机 id 后面拼上所算网卡集合的指纹（共 45 个字符，hub 那边只收十六进制和 -、最长 64）。
         boot:format!("{}-{nics:08x}",system.boot.chars().take(36).collect::<String>()),
         disks, disk_root, disk_mount })
@@ -1029,5 +1116,46 @@ fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000
         schedule.dispatch(&tx);
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_err(), "同一个间隔内只能派发一次");
+    }
+
+    /// 各种容器在普通用户眼里的样子。宿主机也能看到其中一部分（/proc/vz 和 /proc/bc 都有、
+    /// LXCFS 挂在 /var/lib/lxcfs），它们不是容器。按 nex-skKR 的真实情况：沙箱里 /proc 上的 LXCFS 没了，
+    /// 只剩 /sys/devices/system/cpu 那一层，也得认出是 lxc。
+    #[test]
+    fn containers_are_named_from_what_an_unprivileged_process_reads() {
+        let root = std::env::temp_dir().join(format!("probe-agent-virt-{}", std::process::id()));
+        let lxcfs = |point: &str| format!("40 30 0:50 / {point} ro,nosuid,nodev,noexec,relatime - fuse.lxcfs lxcfs ro,user_id=0,group_id=0,allow_other");
+        let cases: [(&[&str], String, Option<&str>); 9] = [
+            (&["proc/vz"], String::new(), Some("openvz")),
+            (&["proc/vz", "proc/bc"], String::new(), None),
+            (&["run/systemd/container=lxc\n"], String::new(), Some("lxc")),
+            (&["run/systemd/container=Bad Name\n"], String::new(), None),
+            (&[".dockerenv"], String::new(), Some("docker")),
+            (&["run/.containerenv"], String::new(), Some("podman")),
+            (&[], lxcfs("/sys/devices/system/cpu"), Some("lxc")),
+            (&[], lxcfs("/var/lib/lxcfs"), None),
+            (&[], String::new(), None),
+        ];
+        for (files, mounts, expected) in cases {
+            let _ = fs::remove_dir_all(&root);
+            for &file in files {
+                let (path, content) = file.split_once('=').unwrap_or((file, ""));
+                fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+                fs::write(root.join(path), content).unwrap();
+            }
+            fs::create_dir_all(&root).unwrap();
+            assert_eq!(container(&root, &parse_mountinfo(&mounts)).as_deref(), expected, "{files:?} {mounts:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hypervisors_are_named_like_systemd_detect_virt() {
+        assert_eq!(hypervisor_name(b"KVMKVMKVM\0\0\0"), "kvm");
+        assert_eq!(hypervisor_name(b"Microsoft Hv"), "hyper-v");
+        assert_eq!(hypervisor_name(b"VBoxVBoxVBox"), "virtualbox");
+        assert_eq!(hypervisor_name(b"            "), "vm");
+        assert!(valid_virt(&virtualization()), "这台跑测试的机器报出来的名字也得过 hub 的校验");
+        assert!(!valid_virt("") && !valid_virt("LXC") && !valid_virt(&"a".repeat(33)));
     }
 }
